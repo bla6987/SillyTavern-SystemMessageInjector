@@ -333,6 +333,94 @@ function createProviderErrorResponse(response, payload) {
     });
 }
 
+function splitTextIntoChunks(text, maxChunkLength = 2400) {
+    if (typeof text !== 'string' || !text) {
+        return [];
+    }
+
+    const paragraphs = text.split(/\n{2,}/).map(x => x.trim()).filter(Boolean);
+    if (!paragraphs.length) {
+        return [text];
+    }
+
+    const chunks = [];
+    let current = '';
+
+    for (const paragraph of paragraphs) {
+        if (!current) {
+            current = paragraph;
+            continue;
+        }
+
+        if ((current.length + 2 + paragraph.length) <= maxChunkLength) {
+            current += `\n\n${paragraph}`;
+            continue;
+        }
+
+        chunks.push(current);
+        current = paragraph;
+    }
+
+    if (current) {
+        chunks.push(current);
+    }
+
+    return chunks.length ? chunks : [text];
+}
+
+function buildBodyVariants(requestBody) {
+    const variants = [];
+    const seen = new Set();
+
+    function addVariant(name, body) {
+        const key = JSON.stringify(body);
+        if (seen.has(key)) {
+            return;
+        }
+        seen.add(key);
+        variants.push({ name, body });
+    }
+
+    addVariant('split', requestBody);
+
+    const messages = requestBody?.messages;
+    if (Array.isArray(messages) && messages.length === 2
+        && messages[0]?.role === 'system'
+        && messages[1]?.role === 'user'
+        && typeof messages[0]?.content === 'string'
+        && typeof messages[1]?.content === 'string') {
+        const system = messages[0].content;
+        const user = messages[1].content;
+
+        if (user.length > 2800) {
+            const chunks = splitTextIntoChunks(user, 2400);
+            if (chunks.length > 1) {
+                addVariant(`chunked-${chunks.length}`, {
+                    ...requestBody,
+                    messages: [
+                        { role: 'system', content: system },
+                        ...chunks.map(chunk => ({ role: 'user', content: chunk })),
+                    ],
+                });
+            }
+        }
+
+        const merged = `${system}\n\n${user}`.trim();
+        if (merged) {
+            addVariant('single-user-merged', {
+                ...requestBody,
+                messages: [{ role: 'user', content: merged }],
+            });
+        }
+    }
+
+    return variants;
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function getTokenBudgetFromBody(body) {
     const values = [
         Number(body?.max_tokens),
@@ -358,6 +446,27 @@ function getSettingsPatchForMemoryBooks(requestBody) {
         custom_include_body: String(requestBody?.custom_include_body ?? oai_settings.custom_include_body ?? ''),
         custom_exclude_body: String(requestBody?.custom_exclude_body ?? oai_settings.custom_exclude_body ?? ''),
         custom_include_headers: String(requestBody?.custom_include_headers ?? oai_settings.custom_include_headers ?? ''),
+        temp_openai: Number.isFinite(temperature) ? temperature : Number(oai_settings.temp_openai ?? 1),
+        openai_max_tokens: Number.isFinite(tokenBudget) ? tokenBudget : Number(oai_settings.openai_max_tokens ?? 512),
+        stream_openai: false,
+        // Preserve system/user split for MemoryBooks payloads.
+        custom_prompt_post_processing: '',
+        request_images: false,
+        enable_web_search: false,
+    };
+}
+
+function getSettingsPatchFromCurrentCustomConfig(requestBody) {
+    const tokenBudget = getTokenBudgetFromBody(requestBody);
+    const temperature = Number(requestBody?.temperature);
+
+    return {
+        chat_completion_source: 'custom',
+        custom_url: String(oai_settings.custom_url || requestBody?.custom_url || ''),
+        custom_model: String(oai_settings.custom_model || requestBody?.custom_model_id || requestBody?.model || ''),
+        custom_include_body: String(oai_settings.custom_include_body ?? ''),
+        custom_exclude_body: String(oai_settings.custom_exclude_body ?? ''),
+        custom_include_headers: String(oai_settings.custom_include_headers ?? ''),
         temp_openai: Number.isFinite(temperature) ? temperature : Number(oai_settings.temp_openai ?? 1),
         openai_max_tokens: Number.isFinite(tokenBudget) ? tokenBudget : Number(oai_settings.openai_max_tokens ?? 512),
         stream_openai: false,
@@ -404,56 +513,109 @@ function toJsonResponse(payload, status = 200, statusText = 'OK') {
 }
 
 async function trySendWithSillyTavernWorkflow(requestBody) {
-    try {
-        const patch = getSettingsPatchForMemoryBooks(requestBody);
-        const data = await withPatchedOpenAISettings(patch, async () => {
-            return await sendOpenAIRequest('quiet', requestBody.messages, undefined, {});
-        });
+    const patches = [getSettingsPatchForMemoryBooks(requestBody)];
+    const currentPatch = getSettingsPatchFromCurrentCustomConfig(requestBody);
+    const hasDistinctCurrentPatch =
+        currentPatch.custom_url !== patches[0].custom_url
+        || currentPatch.custom_model !== patches[0].custom_model
+        || currentPatch.custom_include_body !== patches[0].custom_include_body
+        || currentPatch.custom_include_headers !== patches[0].custom_include_headers
+        || currentPatch.custom_exclude_body !== patches[0].custom_exclude_body;
 
-        const normalized = normalizeResponsePayload(data);
-        if (normalized.changed) {
-            console.log(`[${EXTENSION_NAME}] Normalized MemoryBooks response payload (ST workflow)`);
-        }
-
-        return toJsonResponse(normalized.payload);
-    } catch (error) {
-        console.warn(`[${EXTENSION_NAME}] ST workflow failed, falling back:`, error);
-        return null;
+    if (hasDistinctCurrentPatch) {
+        patches.push(currentPatch);
     }
+
+    for (let i = 0; i < patches.length; i++) {
+        try {
+            if (i > 0) {
+                console.warn(`[${EXTENSION_NAME}] Retrying with active ST custom configuration`);
+            }
+
+            const data = await withPatchedOpenAISettings(patches[i], async () => {
+                return await sendOpenAIRequest('quiet', requestBody.messages, undefined, {});
+            });
+
+            const normalized = normalizeResponsePayload(data);
+            if (normalized.changed) {
+                console.log(`[${EXTENSION_NAME}] Normalized MemoryBooks response payload (ST workflow)`);
+            }
+
+            return toJsonResponse(normalized.payload);
+        } catch (error) {
+            if (i === patches.length - 1) {
+                console.warn(`[${EXTENSION_NAME}] ST workflow failed, falling back:`, error);
+            } else {
+                console.warn(`[${EXTENSION_NAME}] ST workflow attempt failed:`, error);
+            }
+        }
+    }
+
+    return null;
 }
 
 async function sendWithFallback(target, options, requestBody) {
-    const tokenRetries = buildTokenRetryValues(requestBody);
+    const MAX_TOTAL_ATTEMPTS = 4;
+    const MAX_VARIANTS = 2;
+    const MAX_TOKEN_STEPS = 2;
+    const RETRY_BACKOFF_MS = [350, 900, 1600];
+
+    const bodyVariants = buildBodyVariants(requestBody).slice(0, MAX_VARIANTS);
     let lastResponse = null;
+    let totalAttempts = 0;
 
-    for (let i = 0; i < tokenRetries.length; i++) {
-        const maxTokens = tokenRetries[i];
-        const bodyForAttempt = applyMaxTokensForAttempt(requestBody, maxTokens);
+    for (let variantIndex = 0; variantIndex < bodyVariants.length; variantIndex++) {
+        const variant = bodyVariants[variantIndex];
+        const tokenRetries = buildTokenRetryValues(variant.body).slice(0, MAX_TOKEN_STEPS);
 
-        if (i > 0) {
-            console.warn(`[${EXTENSION_NAME}] Retrying MemoryBooks request with max_tokens=${maxTokens}`);
+        if (variantIndex > 0) {
+            console.warn(`[${EXTENSION_NAME}] Retrying with message variant: ${variant.name}`);
         }
 
-        const response = await originalFetch(target, {
-            ...options,
-            body: JSON.stringify(bodyForAttempt),
-        });
-        lastResponse = response;
+        for (let tokenIndex = 0; tokenIndex < tokenRetries.length; tokenIndex++) {
+            if (totalAttempts >= MAX_TOTAL_ATTEMPTS) {
+                return lastResponse;
+            }
 
-        const payload = await tryParseJsonResponse(response);
-        const providerErrorMessage = getProviderErrorMessage(payload);
-        const hasRetrySlot = i < tokenRetries.length - 1;
+            if (totalAttempts > 0) {
+                const backoffIndex = Math.min(totalAttempts - 1, RETRY_BACKOFF_MS.length - 1);
+                await sleep(RETRY_BACKOFF_MS[backoffIndex]);
+            }
 
-        if (hasRetrySlot && (response.status >= 500 || isRetryableProviderError(providerErrorMessage))) {
-            continue;
+            totalAttempts += 1;
+            const maxTokens = tokenRetries[tokenIndex];
+            const bodyForAttempt = applyMaxTokensForAttempt(variant.body, maxTokens);
+
+            if (tokenIndex > 0) {
+                console.warn(`[${EXTENSION_NAME}] Retrying MemoryBooks request with max_tokens=${maxTokens}`);
+            }
+
+            const response = await originalFetch(target, {
+                ...options,
+                body: JSON.stringify(bodyForAttempt),
+            });
+            lastResponse = response;
+
+            const payload = await tryParseJsonResponse(response);
+            const providerErrorMessage = getProviderErrorMessage(payload);
+            const hasRetrySlot = tokenIndex < tokenRetries.length - 1;
+
+            if (hasRetrySlot && (response.status >= 500 || isRetryableProviderError(providerErrorMessage))) {
+                continue;
+            }
+
+            if (payload && providerErrorMessage && response.ok) {
+                const hasVariantSlot = variantIndex < bodyVariants.length - 1;
+                if (hasVariantSlot && isRetryableProviderError(providerErrorMessage)) {
+                    break;
+                }
+
+                console.error(`[${EXTENSION_NAME}] Upstream returned error payload: ${providerErrorMessage}`);
+                return createProviderErrorResponse(response, payload);
+            }
+
+            return response;
         }
-
-        if (payload && providerErrorMessage && response.ok) {
-            console.error(`[${EXTENSION_NAME}] Upstream returned error payload: ${providerErrorMessage}`);
-            return createProviderErrorResponse(response, payload);
-        }
-
-        return response;
     }
 
     return lastResponse;
