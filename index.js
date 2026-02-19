@@ -442,6 +442,65 @@ function diffLastMemoryBooksVsNormal() {
     };
 }
 
+function getWorkingNormalShape() {
+    const normal = getLastNormalEnvelope();
+    if (!normal || !normal.request_shape) {
+        return null;
+    }
+
+    if (normal.request_shape.chat_completion_source !== 'custom') {
+        return null;
+    }
+
+    return normal.request_shape;
+}
+
+function applyWorkingNormalConfig(body) {
+    const working = getWorkingNormalShape();
+    if (!working) {
+        return body;
+    }
+
+    const next = { ...body };
+    next.chat_completion_source = 'custom';
+
+    if (typeof working.model === 'string' && working.model.trim()) {
+        next.model = working.model;
+    }
+    if (typeof working.custom_url === 'string' && working.custom_url.trim()) {
+        next.custom_url = working.custom_url;
+    }
+    if (typeof working.custom_include_body === 'string') {
+        next.custom_include_body = working.custom_include_body;
+    }
+    if (typeof working.custom_include_headers === 'string') {
+        next.custom_include_headers = working.custom_include_headers;
+    }
+    if (typeof working.custom_exclude_body === 'string') {
+        next.custom_exclude_body = working.custom_exclude_body;
+    }
+    if (typeof working.custom_prompt_post_processing === 'string') {
+        next.custom_prompt_post_processing = working.custom_prompt_post_processing;
+    }
+    if (typeof working.user_name === 'string' && working.user_name) {
+        next.user_name = working.user_name;
+    }
+    if (typeof working.char_name === 'string' && working.char_name) {
+        next.char_name = working.char_name;
+    }
+    if (!Array.isArray(next.group_names) && Number.isFinite(working.group_names_count)) {
+        next.group_names = [];
+    }
+
+    if (working.custom_model_id === null || working.custom_model_id === undefined) {
+        delete next.custom_model_id;
+    } else if (typeof working.custom_model_id === 'string' && working.custom_model_id.trim()) {
+        next.custom_model_id = working.custom_model_id;
+    }
+
+    return next;
+}
+
 function publishRawCapture(capture) {
     const history = Array.isArray(window.__SMI_RAW_RESPONSE_HISTORY)
         ? window.__SMI_RAW_RESPONSE_HISTORY
@@ -695,10 +754,14 @@ function buildBodyVariants(requestBody) {
         variants.push({ name, body });
     }
 
-    addVariant('split', requestBody);
-    addVariant('split-active-config', applyActiveCustomConfig(requestBody));
+    const workingConfigBody = applyWorkingNormalConfig(requestBody);
+    const activeConfigBody = applyActiveCustomConfig(workingConfigBody);
 
-    const messages = requestBody?.messages;
+    addVariant('split-working-normal', workingConfigBody);
+    addVariant('split', requestBody);
+    addVariant('split-active-config', activeConfigBody);
+
+    const messages = workingConfigBody?.messages;
     if (Array.isArray(messages) && messages.length === 2
         && messages[0]?.role === 'system'
         && messages[1]?.role === 'user'
@@ -711,7 +774,7 @@ function buildBodyVariants(requestBody) {
             const chunks = splitTextIntoChunks(user, 2400);
             if (chunks.length > 1) {
                 addVariant(`chunked-${chunks.length}`, {
-                    ...requestBody,
+                    ...workingConfigBody,
                     messages: [
                         { role: 'system', content: system },
                         ...chunks.map(chunk => ({ role: 'user', content: chunk })),
@@ -723,7 +786,7 @@ function buildBodyVariants(requestBody) {
         const merged = `${system}\n\n${user}`.trim();
         if (merged) {
             addVariant('single-user-merged', {
-                ...requestBody,
+                ...workingConfigBody,
                 messages: [{ role: 'user', content: merged }],
             });
         }
@@ -813,6 +876,33 @@ function getSettingsPatchFromCurrentCustomConfig(requestBody) {
     };
 }
 
+function getSettingsPatchFromWorkingNormalEnvelope(requestBody) {
+    const working = getWorkingNormalShape();
+    if (!working) {
+        return null;
+    }
+
+    const tokenBudget = getTokenBudgetFromBody(requestBody);
+    const temperature = Number(requestBody?.temperature);
+
+    return {
+        chat_completion_source: 'custom',
+        custom_url: String(working.custom_url || requestBody?.custom_url || oai_settings.custom_url || ''),
+        custom_model: String(working.model || requestBody?.custom_model_id || requestBody?.model || oai_settings.custom_model || ''),
+        custom_include_body: String(working.custom_include_body ?? requestBody?.custom_include_body ?? oai_settings.custom_include_body ?? ''),
+        custom_exclude_body: String(working.custom_exclude_body ?? requestBody?.custom_exclude_body ?? oai_settings.custom_exclude_body ?? ''),
+        custom_include_headers: String(working.custom_include_headers ?? requestBody?.custom_include_headers ?? oai_settings.custom_include_headers ?? ''),
+        temp_openai: Number.isFinite(temperature) ? temperature : Number(oai_settings.temp_openai ?? 1),
+        openai_max_tokens: Number.isFinite(tokenBudget) ? tokenBudget : Number(oai_settings.openai_max_tokens ?? 512),
+        stream_openai: false,
+        custom_prompt_post_processing: typeof working.custom_prompt_post_processing === 'string'
+            ? working.custom_prompt_post_processing
+            : '',
+        request_images: false,
+        enable_web_search: false,
+    };
+}
+
 let settingsPatchQueue = Promise.resolve();
 
 async function withPatchedOpenAISettings(patch, fn) {
@@ -849,39 +939,49 @@ function toJsonResponse(payload, status = 200, statusText = 'OK') {
 }
 
 async function trySendWithSillyTavernWorkflow(requestBody) {
-    const patches = [getSettingsPatchForMemoryBooks(requestBody)];
-    const currentPatch = getSettingsPatchFromCurrentCustomConfig(requestBody);
-    const hasDistinctCurrentPatch =
-        currentPatch.custom_url !== patches[0].custom_url
-        || currentPatch.custom_model !== patches[0].custom_model
-        || currentPatch.custom_include_body !== patches[0].custom_include_body
-        || currentPatch.custom_include_headers !== patches[0].custom_include_headers
-        || currentPatch.custom_exclude_body !== patches[0].custom_exclude_body;
+    const attempts = [];
+    const seen = new Set();
+    const MAX_ST_WORKFLOW_ATTEMPTS = 2;
 
-    if (hasDistinctCurrentPatch) {
-        patches.push(currentPatch);
+    function addAttempt(name, patch) {
+        if (!patch) {
+            return;
+        }
+        const key = JSON.stringify(patch);
+        if (seen.has(key)) {
+            return;
+        }
+        seen.add(key);
+        attempts.push({ name, patch });
     }
 
-    for (let i = 0; i < patches.length; i++) {
+    addAttempt('working-normal-config', getSettingsPatchFromWorkingNormalEnvelope(requestBody));
+    addAttempt('request-payload-config', getSettingsPatchForMemoryBooks(requestBody));
+    addAttempt('active-st-config', getSettingsPatchFromCurrentCustomConfig(requestBody));
+
+    const selectedAttempts = attempts.slice(0, MAX_ST_WORKFLOW_ATTEMPTS);
+
+    for (let i = 0; i < selectedAttempts.length; i++) {
+        const attemptName = selectedAttempts[i].name;
         try {
             if (i > 0) {
-                console.warn(`[${EXTENSION_NAME}] Retrying with active ST custom configuration`);
+                console.warn(`[${EXTENSION_NAME}] Retrying ST workflow with ${attemptName}`);
             }
 
-            const data = await withPatchedOpenAISettings(patches[i], async () => {
+            const data = await withPatchedOpenAISettings(selectedAttempts[i].patch, async () => {
                 return await sendOpenAIRequest('quiet', requestBody.messages, undefined, {});
             });
             await recordRequestEnvelope({
                 isMemoryBooks: true,
                 stage: 'st-workflow',
-                variant: i === 0 ? 'request-payload-config' : 'active-st-config',
+                variant: attemptName,
                 requestBody: requestBody,
                 responsePayload: data,
             });
             await recordRawCapture({
                 channel: 'st-workflow',
                 attempt: i + 1,
-                variant: i === 0 ? 'request-payload-config' : 'active-st-config',
+                variant: attemptName,
                 requestBody: requestBody,
                 payload: data,
             });
@@ -896,17 +996,17 @@ async function trySendWithSillyTavernWorkflow(requestBody) {
             await recordRequestEnvelope({
                 isMemoryBooks: true,
                 stage: 'st-workflow-error',
-                variant: i === 0 ? 'request-payload-config' : 'active-st-config',
+                variant: attemptName,
                 requestBody: requestBody,
             });
             await recordRawCapture({
                 channel: 'st-workflow-error',
                 attempt: i + 1,
-                variant: i === 0 ? 'request-payload-config' : 'active-st-config',
+                variant: attemptName,
                 requestBody: requestBody,
                 error,
             });
-            if (i === patches.length - 1) {
+            if (i === selectedAttempts.length - 1) {
                 console.warn(`[${EXTENSION_NAME}] ST workflow failed, falling back:`, error);
             } else {
                 console.warn(`[${EXTENSION_NAME}] ST workflow attempt failed:`, error);
@@ -918,10 +1018,10 @@ async function trySendWithSillyTavernWorkflow(requestBody) {
 }
 
 async function sendWithFallback(target, options, requestBody) {
-    const MAX_TOTAL_ATTEMPTS = 4;
+    const MAX_TOTAL_ATTEMPTS = 2;
     const MAX_VARIANTS = 2;
-    const MAX_TOKEN_STEPS = 2;
-    const RETRY_BACKOFF_MS = [350, 900, 1600];
+    const MAX_TOKEN_STEPS = 1;
+    const RETRY_BACKOFF_MS = [500];
 
     const bodyVariants = buildBodyVariants(requestBody).slice(0, MAX_VARIANTS);
     let lastResponse = null;
