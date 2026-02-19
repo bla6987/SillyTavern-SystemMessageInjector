@@ -1,6 +1,8 @@
 import { oai_settings, sendOpenAIRequest } from '../../../openai.js';
 
 const EXTENSION_NAME = 'SystemMessageInjector';
+const RAW_CAPTURE_BODY_LIMIT = 50000;
+const RAW_CAPTURE_HISTORY_LIMIT = 20;
 
 const MEMORYBOOKS_DELIMITERS = [
     '=== SCENE TRANSCRIPT ===',
@@ -188,6 +190,122 @@ function extractTextFromResponsePayload(payload) {
     }
 
     return null;
+}
+
+function truncateText(value, maxLength = RAW_CAPTURE_BODY_LIMIT) {
+    if (typeof value !== 'string') {
+        return '';
+    }
+
+    if (value.length <= maxLength) {
+        return value;
+    }
+
+    return `${value.slice(0, maxLength)}\n\n...[truncated ${value.length - maxLength} chars]`;
+}
+
+function cloneHeadersAsObject(headers) {
+    const result = {};
+    if (!headers) {
+        return result;
+    }
+
+    for (const [key, value] of headers.entries()) {
+        if (key.toLowerCase() === 'authorization') {
+            result[key] = '[redacted]';
+        } else {
+            result[key] = value;
+        }
+    }
+
+    return result;
+}
+
+function summarizeRequestBodyForCapture(requestBody) {
+    const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+    return {
+        model: requestBody?.model ?? null,
+        custom_model_id: requestBody?.custom_model_id ?? null,
+        custom_url: requestBody?.custom_url ?? null,
+        chat_completion_source: requestBody?.chat_completion_source ?? null,
+        max_tokens: requestBody?.max_tokens ?? null,
+        max_completion_tokens: requestBody?.max_completion_tokens ?? null,
+        max_output_tokens: requestBody?.max_output_tokens ?? null,
+        stream: requestBody?.stream ?? null,
+        message_count: messages.length,
+        messages: messages.map((m, index) => ({
+            index,
+            role: m?.role ?? null,
+            content_length: typeof m?.content === 'string' ? m.content.length : null,
+            content_preview: typeof m?.content === 'string'
+                ? truncateText(m.content, 300)
+                : null,
+        })),
+    };
+}
+
+function publishRawCapture(capture) {
+    const history = Array.isArray(window.__SMI_RAW_RESPONSE_HISTORY)
+        ? window.__SMI_RAW_RESPONSE_HISTORY
+        : [];
+    history.unshift(capture);
+    if (history.length > RAW_CAPTURE_HISTORY_LIMIT) {
+        history.length = RAW_CAPTURE_HISTORY_LIMIT;
+    }
+
+    window.__SMI_RAW_RESPONSE_HISTORY = history;
+    window.__SMI_LAST_RAW_RESPONSE = capture;
+}
+
+async function recordRawCapture({
+    channel,
+    attempt,
+    variant,
+    requestBody,
+    response = null,
+    payload = null,
+    error = null,
+}) {
+    const capture = {
+        timestamp: new Date().toISOString(),
+        channel,
+        attempt,
+        variant,
+        request: summarizeRequestBodyForCapture(requestBody),
+        response: null,
+        error: null,
+    };
+
+    if (response) {
+        let bodyText = '';
+        try {
+            bodyText = await response.clone().text();
+        } catch {
+            bodyText = '';
+        }
+
+        capture.response = {
+            ok: response.ok,
+            status: response.status,
+            statusText: response.statusText,
+            headers: cloneHeadersAsObject(response.headers),
+            body_text: truncateText(bodyText),
+        };
+
+        if (payload !== null && payload !== undefined) {
+            capture.response.body_json = payload;
+        }
+    }
+
+    if (error) {
+        capture.error = {
+            message: String(error?.message || error),
+            stack: String(error?.stack || ''),
+        };
+    }
+
+    publishRawCapture(capture);
+    console.log(`[${EXTENSION_NAME}] Captured raw response`, capture);
 }
 
 function normalizeResponsePayload(payload) {
@@ -555,6 +673,13 @@ async function trySendWithSillyTavernWorkflow(requestBody) {
             const data = await withPatchedOpenAISettings(patches[i], async () => {
                 return await sendOpenAIRequest('quiet', requestBody.messages, undefined, {});
             });
+            await recordRawCapture({
+                channel: 'st-workflow',
+                attempt: i + 1,
+                variant: i === 0 ? 'request-payload-config' : 'active-st-config',
+                requestBody: requestBody,
+                payload: data,
+            });
 
             const normalized = normalizeResponsePayload(data);
             if (normalized.changed) {
@@ -563,6 +688,13 @@ async function trySendWithSillyTavernWorkflow(requestBody) {
 
             return toJsonResponse(normalized.payload);
         } catch (error) {
+            await recordRawCapture({
+                channel: 'st-workflow-error',
+                attempt: i + 1,
+                variant: i === 0 ? 'request-payload-config' : 'active-st-config',
+                requestBody: requestBody,
+                error,
+            });
             if (i === patches.length - 1) {
                 console.warn(`[${EXTENSION_NAME}] ST workflow failed, falling back:`, error);
             } else {
@@ -617,6 +749,14 @@ async function sendWithFallback(target, options, requestBody) {
             lastResponse = response;
 
             const payload = await tryParseJsonResponse(response);
+            await recordRawCapture({
+                channel: 'fallback-fetch',
+                attempt: totalAttempts,
+                variant: variant.name,
+                requestBody: bodyForAttempt,
+                response,
+                payload,
+            });
             const providerErrorMessage = getProviderErrorMessage(payload);
             const hasRetrySlot = tokenIndex < tokenRetries.length - 1;
 
@@ -705,6 +845,17 @@ function enrichRequestBody(body) {
 }
 
 const originalFetch = window.fetch.bind(window);
+
+window.SystemMessageInjector = {
+    getLastRawResponse: () => window.__SMI_LAST_RAW_RESPONSE || null,
+    getRawResponseHistory: () => Array.isArray(window.__SMI_RAW_RESPONSE_HISTORY)
+        ? [...window.__SMI_RAW_RESPONSE_HISTORY]
+        : [],
+    clearRawResponseHistory: () => {
+        window.__SMI_RAW_RESPONSE_HISTORY = [];
+        window.__SMI_LAST_RAW_RESPONSE = null;
+    },
+};
 
 window.fetch = async function (target, options) {
     const url = getRequestUrl(target);
