@@ -1,4 +1,4 @@
-import { oai_settings } from '../../../openai.js';
+import { oai_settings, sendOpenAIRequest } from '../../../openai.js';
 
 const EXTENSION_NAME = 'SystemMessageInjector';
 
@@ -333,6 +333,95 @@ function createProviderErrorResponse(response, payload) {
     });
 }
 
+function getTokenBudgetFromBody(body) {
+    const values = [
+        Number(body?.max_tokens),
+        Number(body?.max_completion_tokens),
+        Number(body?.max_output_tokens),
+    ].filter(v => Number.isFinite(v) && v > 0).map(v => Math.floor(v));
+
+    if (!values.length) {
+        return null;
+    }
+
+    return Math.max(...values);
+}
+
+function getSettingsPatchForMemoryBooks(requestBody) {
+    const tokenBudget = getTokenBudgetFromBody(requestBody);
+    const temperature = Number(requestBody?.temperature);
+
+    return {
+        chat_completion_source: 'custom',
+        custom_url: String(requestBody?.custom_url || oai_settings.custom_url || ''),
+        custom_model: String(requestBody?.custom_model_id || requestBody?.model || oai_settings.custom_model || ''),
+        custom_include_body: String(requestBody?.custom_include_body ?? oai_settings.custom_include_body ?? ''),
+        custom_exclude_body: String(requestBody?.custom_exclude_body ?? oai_settings.custom_exclude_body ?? ''),
+        custom_include_headers: String(requestBody?.custom_include_headers ?? oai_settings.custom_include_headers ?? ''),
+        temp_openai: Number.isFinite(temperature) ? temperature : Number(oai_settings.temp_openai ?? 1),
+        openai_max_tokens: Number.isFinite(tokenBudget) ? tokenBudget : Number(oai_settings.openai_max_tokens ?? 512),
+        stream_openai: false,
+        // Preserve system/user split for MemoryBooks payloads.
+        custom_prompt_post_processing: '',
+        request_images: false,
+        enable_web_search: false,
+    };
+}
+
+let settingsPatchQueue = Promise.resolve();
+
+async function withPatchedOpenAISettings(patch, fn) {
+    const run = async () => {
+        const keys = Object.keys(patch);
+        const original = {};
+
+        for (const key of keys) {
+            original[key] = oai_settings[key];
+            oai_settings[key] = patch[key];
+        }
+
+        try {
+            return await fn();
+        } finally {
+            for (const key of keys) {
+                oai_settings[key] = original[key];
+            }
+        }
+    };
+
+    settingsPatchQueue = settingsPatchQueue.then(run, run);
+    return settingsPatchQueue;
+}
+
+function toJsonResponse(payload, status = 200, statusText = 'OK') {
+    return new Response(JSON.stringify(payload), {
+        status,
+        statusText,
+        headers: {
+            'content-type': 'application/json; charset=utf-8',
+        },
+    });
+}
+
+async function trySendWithSillyTavernWorkflow(requestBody) {
+    try {
+        const patch = getSettingsPatchForMemoryBooks(requestBody);
+        const data = await withPatchedOpenAISettings(patch, async () => {
+            return await sendOpenAIRequest('quiet', requestBody.messages, undefined, {});
+        });
+
+        const normalized = normalizeResponsePayload(data);
+        if (normalized.changed) {
+            console.log(`[${EXTENSION_NAME}] Normalized MemoryBooks response payload (ST workflow)`);
+        }
+
+        return toJsonResponse(normalized.payload);
+    } catch (error) {
+        console.warn(`[${EXTENSION_NAME}] ST workflow failed, falling back:`, error);
+        return null;
+    }
+}
+
 async function sendWithFallback(target, options, requestBody) {
     const tokenRetries = buildTokenRetryValues(requestBody);
     let lastResponse = null;
@@ -465,6 +554,11 @@ window.fetch = async function (target, options) {
             : 'no split marker found';
 
         console.log(`[${EXTENSION_NAME}] Intercepted MemoryBooks request (${splitInfo})`);
+
+        const stWorkflowResponse = await trySendWithSillyTavernWorkflow(enriched.body);
+        if (stWorkflowResponse) {
+            return stWorkflowResponse;
+        }
 
         const response = await sendWithFallback(target, options, enriched.body);
         return normalizeMemoryBooksResponse(response);
