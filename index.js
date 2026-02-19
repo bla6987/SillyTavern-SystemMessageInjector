@@ -1,6 +1,7 @@
 import { oai_settings, sendOpenAIRequest } from '../../../openai.js';
 
 const EXTENSION_NAME = 'SystemMessageInjector';
+const BUILD_TAG = '2026-02-19-stream-bridge-v3';
 const RAW_CAPTURE_BODY_LIMIT = 50000;
 const RAW_CAPTURE_HISTORY_LIMIT = 20;
 const REQUEST_ENVELOPE_HISTORY_LIMIT = 50;
@@ -606,6 +607,208 @@ function normalizeResponsePayload(payload) {
     return { changed: true, payload: normalized };
 }
 
+function extractTextFromStreamingChunk(payload) {
+    if (!payload || typeof payload !== 'object') {
+        return '';
+    }
+
+    const deltaContent = payload?.choices?.[0]?.delta?.content;
+    if (typeof deltaContent === 'string') {
+        return deltaContent;
+    }
+
+    if (Array.isArray(deltaContent)) {
+        const joined = deltaContent
+            .map(part => {
+                if (typeof part === 'string') return part;
+                if (typeof part?.text === 'string') return part.text;
+                return '';
+            })
+            .join('');
+        if (joined) {
+            return joined;
+        }
+    }
+
+    const deltaText = payload?.choices?.[0]?.text;
+    if (typeof deltaText === 'string') {
+        return deltaText;
+    }
+
+    const claudeDeltaText = payload?.delta?.text;
+    if (typeof claudeDeltaText === 'string') {
+        return claudeDeltaText;
+    }
+
+    const geminiParts = payload?.candidates?.[0]?.content?.parts;
+    if (Array.isArray(geminiParts)) {
+        const geminiText = geminiParts
+            .map(part => (typeof part?.text === 'string' ? part.text : ''))
+            .join('');
+        if (geminiText) {
+            return geminiText;
+        }
+    }
+
+    return '';
+}
+
+function buildJsonPayloadFromText(text, template = null) {
+    const source = (template && typeof template === 'object' && !Array.isArray(template))
+        ? template
+        : {};
+    const payload = {
+        ...source,
+        id: source.id || `chatcmpl-memorybooks-${Date.now()}`,
+        object: source.object || 'chat.completion',
+        created: Number.isFinite(source.created) ? source.created : Math.floor(Date.now() / 1000),
+        choices: [{
+            index: 0,
+            message: {
+                role: 'assistant',
+                content: text,
+            },
+            finish_reason: 'stop',
+        }],
+    };
+
+    if (!payload.usage || typeof payload.usage !== 'object') {
+        payload.usage = {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
+    }
+
+    return payload;
+}
+
+function splitSseEventBlocks(buffer) {
+    const blocks = [];
+    let start = 0;
+
+    for (let i = 0; i < buffer.length - 1; i++) {
+        if (buffer[i] === '\n' && buffer[i + 1] === '\n') {
+            blocks.push(buffer.slice(start, i));
+            start = i + 2;
+            i += 1;
+        }
+    }
+
+    return {
+        blocks,
+        remainder: buffer.slice(start),
+    };
+}
+
+function parseSseDataBlock(block) {
+    const lines = String(block || '').split('\n');
+    const dataLines = lines
+        .filter(line => line.startsWith('data:'))
+        .map(line => line.slice(5).trimStart());
+
+    if (!dataLines.length) {
+        return '';
+    }
+
+    return dataLines.join('\n').trim();
+}
+
+async function convertStreamingResponseToJson(response) {
+    if (!response?.ok || !response.body) {
+        return response;
+    }
+
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('text/event-stream')) {
+        return response;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let text = '';
+    let lastPayload = null;
+    let errorMessage = '';
+
+    function processBlock(block) {
+        const rawData = parseSseDataBlock(block);
+        if (!rawData || rawData === '[DONE]') {
+            return;
+        }
+
+        let parsed = null;
+        try {
+            parsed = JSON.parse(rawData);
+        } catch {
+            return;
+        }
+
+        lastPayload = parsed;
+        const providerError = getProviderErrorMessage(parsed);
+        if (providerError) {
+            errorMessage = providerError;
+            return;
+        }
+
+        const chunkText = extractTextFromStreamingChunk(parsed);
+        if (chunkText) {
+            text += chunkText;
+        }
+    }
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+
+            buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+            const { blocks, remainder } = splitSseEventBlocks(buffer);
+            buffer = remainder;
+
+            for (const block of blocks) {
+                processBlock(block);
+            }
+        }
+
+        const tail = decoder.decode();
+        if (tail) {
+            buffer += tail.replace(/\r\n/g, '\n');
+        }
+        if (buffer.trim()) {
+            processBlock(buffer);
+        }
+    } catch (error) {
+        return toJsonResponse({
+            error: { message: String(error?.message || error || 'Failed to parse streaming response') },
+            quota_error: false,
+        }, 502, 'Bad Gateway');
+    }
+
+    if (errorMessage) {
+        return toJsonResponse({
+            error: { message: errorMessage },
+            quota_error: false,
+        }, 502, 'Bad Gateway');
+    }
+
+    if (!text && lastPayload) {
+        text = extractTextFromResponsePayload(lastPayload) || '';
+    }
+
+    if (!text) {
+        return toJsonResponse({
+            error: { message: 'Streaming response contained no text output' },
+            quota_error: false,
+        }, 502, 'Bad Gateway');
+    }
+
+    const payload = buildJsonPayloadFromText(text, lastPayload);
+    return toJsonResponse(payload);
+}
+
 function getProviderErrorMessage(payload) {
     const message = payload?.error?.message;
     if (typeof message === 'string' && message.trim()) {
@@ -757,9 +960,12 @@ function buildBodyVariants(requestBody) {
     const workingConfigBody = applyWorkingNormalConfig(requestBody);
     const activeConfigBody = applyActiveCustomConfig(workingConfigBody);
 
-    addVariant('split-working-normal', workingConfigBody);
-    addVariant('split', requestBody);
-    addVariant('split-active-config', activeConfigBody);
+    const streamBody = {
+        ...workingConfigBody,
+        stream: true,
+    };
+
+    addVariant('split-working-normal-stream', streamBody);
 
     const messages = workingConfigBody?.messages;
     if (Array.isArray(messages) && messages.length === 2
@@ -773,6 +979,13 @@ function buildBodyVariants(requestBody) {
         if (user.length > 2800) {
             const chunks = splitTextIntoChunks(user, 2400);
             if (chunks.length > 1) {
+                addVariant(`chunked-${chunks.length}-stream`, {
+                    ...streamBody,
+                    messages: [
+                        { role: 'system', content: system },
+                        ...chunks.map(chunk => ({ role: 'user', content: chunk })),
+                    ],
+                });
                 addVariant(`chunked-${chunks.length}`, {
                     ...workingConfigBody,
                     messages: [
@@ -791,6 +1004,10 @@ function buildBodyVariants(requestBody) {
             });
         }
     }
+
+    addVariant('split-working-normal', workingConfigBody);
+    addVariant('split', requestBody);
+    addVariant('split-active-config', activeConfigBody);
 
     return variants;
 }
@@ -938,10 +1155,19 @@ function toJsonResponse(payload, status = 200, statusText = 'OK') {
     });
 }
 
+function shouldTrySillyTavernWorkflow() {
+    const working = getWorkingNormalShape();
+    if (working && working.stream === true) {
+        return false;
+    }
+
+    return true;
+}
+
 async function trySendWithSillyTavernWorkflow(requestBody) {
     const attempts = [];
     const seen = new Set();
-    const MAX_ST_WORKFLOW_ATTEMPTS = 2;
+    const MAX_ST_WORKFLOW_ATTEMPTS = 1;
 
     function addAttempt(name, patch) {
         if (!patch) {
@@ -1024,6 +1250,11 @@ async function sendWithFallback(target, options, requestBody) {
     const RETRY_BACKOFF_MS = [500];
 
     const bodyVariants = buildBodyVariants(requestBody).slice(0, MAX_VARIANTS);
+    console.log(`[${EXTENSION_NAME}] Fallback variants`, bodyVariants.map(v => ({
+        name: v.name,
+        stream: Boolean(v.body?.stream),
+        message_count: Array.isArray(v.body?.messages) ? v.body.messages.length : null,
+    })));
     let lastResponse = null;
     let totalAttempts = 0;
 
@@ -1053,10 +1284,13 @@ async function sendWithFallback(target, options, requestBody) {
                 console.warn(`[${EXTENSION_NAME}] Retrying MemoryBooks request with max_tokens=${maxTokens}`);
             }
 
-            const response = await originalFetch(target, {
+            let response = await originalFetch(target, {
                 ...options,
                 body: JSON.stringify(bodyForAttempt),
             });
+            if (bodyForAttempt.stream === true && response.ok) {
+                response = await convertStreamingResponseToJson(response);
+            }
             lastResponse = response;
 
             const payload = await tryParseJsonResponse(response);
@@ -1166,6 +1400,7 @@ function enrichRequestBody(body) {
 const originalFetch = window.fetch.bind(window);
 
 window.SystemMessageInjector = {
+    getBuildInfo: () => ({ extension: EXTENSION_NAME, build: BUILD_TAG }),
     getLastRawResponse: () => window.__SMI_LAST_RAW_RESPONSE || null,
     getRawResponseHistory: () => Array.isArray(window.__SMI_RAW_RESPONSE_HISTORY)
         ? [...window.__SMI_RAW_RESPONSE_HISTORY]
@@ -1232,9 +1467,13 @@ window.fetch = async function (target, options) {
             requestBody: enriched.body,
         });
 
-        const stWorkflowResponse = await trySendWithSillyTavernWorkflow(enriched.body);
-        if (stWorkflowResponse) {
-            return stWorkflowResponse;
+        if (shouldTrySillyTavernWorkflow()) {
+            const stWorkflowResponse = await trySendWithSillyTavernWorkflow(enriched.body);
+            if (stWorkflowResponse) {
+                return stWorkflowResponse;
+            }
+        } else {
+            console.log(`[${EXTENSION_NAME}] Skipping ST workflow: normal chat uses streaming`);
         }
 
         const response = await sendWithFallback(target, options, enriched.body);
@@ -1246,4 +1485,4 @@ window.fetch = async function (target, options) {
     return originalFetch(target, options);
 };
 
-console.log(`[${EXTENSION_NAME}] Active`);
+console.log(`[${EXTENSION_NAME}] Active build=${BUILD_TAG}`);
