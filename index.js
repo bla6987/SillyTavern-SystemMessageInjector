@@ -3,6 +3,7 @@ import { oai_settings, sendOpenAIRequest } from '../../../openai.js';
 const EXTENSION_NAME = 'SystemMessageInjector';
 const RAW_CAPTURE_BODY_LIMIT = 50000;
 const RAW_CAPTURE_HISTORY_LIMIT = 20;
+const REQUEST_ENVELOPE_HISTORY_LIMIT = 50;
 
 const MEMORYBOOKS_DELIMITERS = [
     '=== SCENE TRANSCRIPT ===',
@@ -241,6 +242,203 @@ function summarizeRequestBodyForCapture(requestBody) {
                 ? truncateText(m.content, 300)
                 : null,
         })),
+    };
+}
+
+function buildRequestShapeForDiff(requestBody) {
+    const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+    return {
+        chat_completion_source: requestBody?.chat_completion_source ?? null,
+        model: requestBody?.model ?? null,
+        custom_model_id: requestBody?.custom_model_id ?? null,
+        custom_url: requestBody?.custom_url ?? null,
+        temperature: requestBody?.temperature ?? null,
+        max_tokens: requestBody?.max_tokens ?? null,
+        max_completion_tokens: requestBody?.max_completion_tokens ?? null,
+        max_output_tokens: requestBody?.max_output_tokens ?? null,
+        stream: requestBody?.stream ?? null,
+        custom_prompt_post_processing: requestBody?.custom_prompt_post_processing ?? null,
+        custom_include_body: requestBody?.custom_include_body ?? null,
+        custom_include_headers: requestBody?.custom_include_headers ?? null,
+        custom_exclude_body: requestBody?.custom_exclude_body ?? null,
+        user_name: requestBody?.user_name ?? null,
+        char_name: requestBody?.char_name ?? null,
+        group_names_count: Array.isArray(requestBody?.group_names) ? requestBody.group_names.length : null,
+        stop_count: Array.isArray(requestBody?.stop) ? requestBody.stop.length : null,
+        tool_count: Array.isArray(requestBody?.tools) ? requestBody.tools.length : null,
+        messages: messages.map((message, index) => ({
+            index,
+            role: message?.role ?? null,
+            name: message?.name ?? null,
+            content_type: Array.isArray(message?.content) ? 'array' : typeof message?.content,
+            content_length: typeof message?.content === 'string' ? message.content.length : null,
+        })),
+    };
+}
+
+function flattenForDiff(value, prefix = '', out = {}) {
+    const key = prefix || '(root)';
+    if (value === null || value === undefined || typeof value !== 'object') {
+        out[key] = value;
+        return out;
+    }
+
+    if (Array.isArray(value)) {
+        out[`${key}.length`] = value.length;
+        for (let i = 0; i < value.length; i++) {
+            flattenForDiff(value[i], `${key}[${i}]`, out);
+        }
+        return out;
+    }
+
+    const entries = Object.entries(value);
+    if (!entries.length) {
+        out[key] = {};
+        return out;
+    }
+
+    for (const [childKey, childValue] of entries) {
+        const childPath = prefix ? `${prefix}.${childKey}` : childKey;
+        flattenForDiff(childValue, childPath, out);
+    }
+
+    return out;
+}
+
+function diffRequestShapes(leftShape, rightShape) {
+    const left = flattenForDiff(leftShape);
+    const right = flattenForDiff(rightShape);
+    const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+    const diffs = [];
+
+    for (const key of Array.from(keys).sort()) {
+        const leftValue = left[key];
+        const rightValue = right[key];
+        if (JSON.stringify(leftValue) !== JSON.stringify(rightValue)) {
+            diffs.push({
+                path: key,
+                memorybooks: leftValue,
+                normal_chat: rightValue,
+            });
+        }
+    }
+
+    return diffs;
+}
+
+function publishRequestEnvelope(envelope) {
+    const history = Array.isArray(window.__SMI_REQUEST_ENVELOPE_HISTORY)
+        ? window.__SMI_REQUEST_ENVELOPE_HISTORY
+        : [];
+    history.unshift(envelope);
+    if (history.length > REQUEST_ENVELOPE_HISTORY_LIMIT) {
+        history.length = REQUEST_ENVELOPE_HISTORY_LIMIT;
+    }
+    window.__SMI_REQUEST_ENVELOPE_HISTORY = history;
+    window.__SMI_LAST_REQUEST_ENVELOPE = envelope;
+}
+
+async function recordRequestEnvelope({
+    isMemoryBooks,
+    stage,
+    variant,
+    requestBody,
+    response = null,
+    responsePayload = null,
+}) {
+    const envelope = {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
+        timestamp: new Date().toISOString(),
+        is_memorybooks: Boolean(isMemoryBooks),
+        stage: String(stage || ''),
+        variant: String(variant || ''),
+        request: summarizeRequestBodyForCapture(requestBody),
+        request_shape: buildRequestShapeForDiff(requestBody),
+        response: null,
+    };
+
+    if (response) {
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+        const summary = {
+            ok: response.ok,
+            status: response.status,
+            statusText: response.statusText,
+            content_type: contentType,
+            has_error_payload: false,
+            error_message: null,
+        };
+
+        if (responsePayload && typeof responsePayload === 'object') {
+            const errorMessage = responsePayload?.error?.message;
+            if (typeof errorMessage === 'string' && errorMessage.trim()) {
+                summary.has_error_payload = true;
+                summary.error_message = errorMessage.trim();
+            }
+        } else if (response.ok && !requestBody?.stream && contentType.includes('application/json')) {
+            try {
+                const parsed = await response.clone().json();
+                const errorMessage = parsed?.error?.message;
+                if (typeof errorMessage === 'string' && errorMessage.trim()) {
+                    summary.has_error_payload = true;
+                    summary.error_message = errorMessage.trim();
+                }
+            } catch {
+                // ignore parse errors for envelope summaries
+            }
+        }
+
+        envelope.response = summary;
+    }
+
+    publishRequestEnvelope(envelope);
+}
+
+function findLastEnvelope(predicate) {
+    const history = Array.isArray(window.__SMI_REQUEST_ENVELOPE_HISTORY)
+        ? window.__SMI_REQUEST_ENVELOPE_HISTORY
+        : [];
+    return history.find(predicate) || null;
+}
+
+function getLastMemoryBooksEnvelope() {
+    return findLastEnvelope(item => item?.is_memorybooks === true);
+}
+
+function getLastNormalEnvelope() {
+    return findLastEnvelope(item =>
+        item?.is_memorybooks === false
+        && item?.response?.ok === true
+        && item?.response?.has_error_payload === false
+        && item?.request_shape?.chat_completion_source === 'custom',
+    ) || findLastEnvelope(item =>
+        item?.is_memorybooks === false
+        && item?.response?.ok === true
+        && item?.response?.has_error_payload === false,
+    );
+}
+
+function diffLastMemoryBooksVsNormal() {
+    const memoryBooks = getLastMemoryBooksEnvelope();
+    const normal = getLastNormalEnvelope();
+
+    if (!memoryBooks || !normal) {
+        return {
+            ok: false,
+            message: 'Need both one MemoryBooks envelope and one successful normal-chat envelope.',
+            memorybooks_found: Boolean(memoryBooks),
+            normal_found: Boolean(normal),
+        };
+    }
+
+    const diffs = diffRequestShapes(memoryBooks.request_shape, normal.request_shape);
+    return {
+        ok: true,
+        memorybooks_id: memoryBooks.id,
+        normal_id: normal.id,
+        memorybooks_timestamp: memoryBooks.timestamp,
+        normal_timestamp: normal.timestamp,
+        diff_count: diffs.length,
+        diffs,
     };
 }
 
@@ -673,6 +871,13 @@ async function trySendWithSillyTavernWorkflow(requestBody) {
             const data = await withPatchedOpenAISettings(patches[i], async () => {
                 return await sendOpenAIRequest('quiet', requestBody.messages, undefined, {});
             });
+            await recordRequestEnvelope({
+                isMemoryBooks: true,
+                stage: 'st-workflow',
+                variant: i === 0 ? 'request-payload-config' : 'active-st-config',
+                requestBody: requestBody,
+                responsePayload: data,
+            });
             await recordRawCapture({
                 channel: 'st-workflow',
                 attempt: i + 1,
@@ -688,6 +893,12 @@ async function trySendWithSillyTavernWorkflow(requestBody) {
 
             return toJsonResponse(normalized.payload);
         } catch (error) {
+            await recordRequestEnvelope({
+                isMemoryBooks: true,
+                stage: 'st-workflow-error',
+                variant: i === 0 ? 'request-payload-config' : 'active-st-config',
+                requestBody: requestBody,
+            });
             await recordRawCapture({
                 channel: 'st-workflow-error',
                 attempt: i + 1,
@@ -749,6 +960,14 @@ async function sendWithFallback(target, options, requestBody) {
             lastResponse = response;
 
             const payload = await tryParseJsonResponse(response);
+            await recordRequestEnvelope({
+                isMemoryBooks: true,
+                stage: 'fallback-fetch',
+                variant: variant.name,
+                requestBody: bodyForAttempt,
+                response,
+                responsePayload: payload,
+            });
             await recordRawCapture({
                 channel: 'fallback-fetch',
                 attempt: totalAttempts,
@@ -851,9 +1070,20 @@ window.SystemMessageInjector = {
     getRawResponseHistory: () => Array.isArray(window.__SMI_RAW_RESPONSE_HISTORY)
         ? [...window.__SMI_RAW_RESPONSE_HISTORY]
         : [],
+    getLastRequestEnvelope: () => window.__SMI_LAST_REQUEST_ENVELOPE || null,
+    getRequestEnvelopeHistory: () => Array.isArray(window.__SMI_REQUEST_ENVELOPE_HISTORY)
+        ? [...window.__SMI_REQUEST_ENVELOPE_HISTORY]
+        : [],
+    getLastMemoryBooksEnvelope,
+    getLastNormalEnvelope,
+    diffLastMemoryBooksVsNormal,
     clearRawResponseHistory: () => {
         window.__SMI_RAW_RESPONSE_HISTORY = [];
         window.__SMI_LAST_RAW_RESPONSE = null;
+    },
+    clearRequestEnvelopeHistory: () => {
+        window.__SMI_REQUEST_ENVELOPE_HISTORY = [];
+        window.__SMI_LAST_REQUEST_ENVELOPE = null;
     },
 };
 
@@ -871,11 +1101,19 @@ window.fetch = async function (target, options) {
 
         const body = JSON.parse(options.body);
         const stack = new Error().stack || '';
-        if (!isMemoryBooksRequest(body, stack)) {
-            return originalFetch(target, options);
-        }
-        if (!isCustomEndpointRequest(body)) {
-            return originalFetch(target, options);
+        const memoryBooksDetected = isMemoryBooksRequest(body, stack);
+        const customEndpointDetected = isCustomEndpointRequest(body);
+
+        if (!memoryBooksDetected || !customEndpointDetected) {
+            const passthroughResponse = await originalFetch(target, options);
+            await recordRequestEnvelope({
+                isMemoryBooks: memoryBooksDetected,
+                stage: 'passthrough',
+                variant: memoryBooksDetected ? 'non-custom-or-unhandled' : 'normal',
+                requestBody: body,
+                response: passthroughResponse,
+            });
+            return passthroughResponse;
         }
 
         const enriched = enrichRequestBody(body);
@@ -887,6 +1125,12 @@ window.fetch = async function (target, options) {
             : 'no split marker found';
 
         console.log(`[${EXTENSION_NAME}] Intercepted MemoryBooks request (${splitInfo})`);
+        await recordRequestEnvelope({
+            isMemoryBooks: true,
+            stage: 'transformed',
+            variant: enriched.didSplit ? 'split' : 'no-split',
+            requestBody: enriched.body,
+        });
 
         const stWorkflowResponse = await trySendWithSillyTavernWorkflow(enriched.body);
         if (stWorkflowResponse) {
