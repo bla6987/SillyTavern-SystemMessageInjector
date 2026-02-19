@@ -1,0 +1,12 @@
+{
+    "display_name": "System Message Injector",
+    "loading_order": 1,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "Pop",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false
+}
