@@ -957,17 +957,25 @@ function buildBodyVariants(requestBody) {
         variants.push({ name, body });
     }
 
-    const workingConfigBody = applyWorkingNormalConfig(requestBody);
+    const hasWorkingNormal = Boolean(getWorkingNormalShape());
+    const workingConfigBody = hasWorkingNormal
+        ? applyWorkingNormalConfig(requestBody)
+        : requestBody;
     const activeConfigBody = applyActiveCustomConfig(workingConfigBody);
 
-    const streamBody = {
-        ...workingConfigBody,
+    const primaryBody = hasWorkingNormal ? workingConfigBody : activeConfigBody;
+    const secondaryBody = hasWorkingNormal ? activeConfigBody : workingConfigBody;
+    const primaryName = hasWorkingNormal ? 'split-working-normal' : 'split-active-config';
+    const secondaryName = hasWorkingNormal ? 'split-active-config' : 'split-working-normal';
+
+    const streamPrimaryBody = {
+        ...primaryBody,
         stream: true,
     };
 
-    addVariant('split-working-normal-stream', streamBody);
+    addVariant(`${primaryName}-stream`, streamPrimaryBody);
 
-    const messages = workingConfigBody?.messages;
+    const messages = primaryBody?.messages;
     if (Array.isArray(messages) && messages.length === 2
         && messages[0]?.role === 'system'
         && messages[1]?.role === 'user'
@@ -980,14 +988,14 @@ function buildBodyVariants(requestBody) {
             const chunks = splitTextIntoChunks(user, 2400);
             if (chunks.length > 1) {
                 addVariant(`chunked-${chunks.length}-stream`, {
-                    ...streamBody,
+                    ...streamPrimaryBody,
                     messages: [
                         { role: 'system', content: system },
                         ...chunks.map(chunk => ({ role: 'user', content: chunk })),
                     ],
                 });
                 addVariant(`chunked-${chunks.length}`, {
-                    ...workingConfigBody,
+                    ...primaryBody,
                     messages: [
                         { role: 'system', content: system },
                         ...chunks.map(chunk => ({ role: 'user', content: chunk })),
@@ -999,21 +1007,26 @@ function buildBodyVariants(requestBody) {
         const merged = `${system}\n\n${user}`.trim();
         if (merged) {
             addVariant('single-user-merged', {
-                ...workingConfigBody,
+                ...primaryBody,
                 messages: [{ role: 'user', content: merged }],
             });
         }
     }
 
-    addVariant('split-working-normal', workingConfigBody);
+    addVariant(primaryName, primaryBody);
+    addVariant(`${secondaryName}-stream`, {
+        ...secondaryBody,
+        stream: true,
+    });
+    addVariant(secondaryName, secondaryBody);
     addVariant('split', requestBody);
-    addVariant('split-active-config', activeConfigBody);
 
     return variants;
 }
 
 function applyActiveCustomConfig(body) {
     const next = { ...body };
+    next.chat_completion_source = 'custom';
 
     const activeUrl = String(oai_settings.custom_url || '').trim();
     if (activeUrl) {
@@ -1029,6 +1042,9 @@ function applyActiveCustomConfig(body) {
     next.custom_include_body = String(oai_settings.custom_include_body ?? next.custom_include_body ?? '');
     next.custom_include_headers = String(oai_settings.custom_include_headers ?? next.custom_include_headers ?? '');
     next.custom_exclude_body = String(oai_settings.custom_exclude_body ?? next.custom_exclude_body ?? '');
+    if (typeof oai_settings.custom_prompt_post_processing === 'string') {
+        next.custom_prompt_post_processing = oai_settings.custom_prompt_post_processing;
+    }
 
     return next;
 }
@@ -1156,12 +1172,7 @@ function toJsonResponse(payload, status = 200, statusText = 'OK') {
 }
 
 function shouldTrySillyTavernWorkflow() {
-    const working = getWorkingNormalShape();
-    if (working && working.stream === true) {
-        return false;
-    }
-
-    return true;
+    return window.__SMI_FORCE_ST_WORKFLOW === true;
 }
 
 async function trySendWithSillyTavernWorkflow(requestBody) {
