@@ -84,6 +84,324 @@ function splitMemoryBooksPrompt(content, delimiter) {
     return null;
 }
 
+function extractTextFromContent(content) {
+    if (typeof content === 'string') {
+        return content;
+    }
+
+    if (content && typeof content === 'object' && typeof content.text === 'string') {
+        return content.text;
+    }
+
+    if (!Array.isArray(content)) {
+        return null;
+    }
+
+    const parts = [];
+    for (const item of content) {
+        if (typeof item === 'string') {
+            parts.push(item);
+            continue;
+        }
+
+        if (!item || typeof item !== 'object') {
+            continue;
+        }
+
+        if (typeof item.text === 'string') {
+            parts.push(item.text);
+            continue;
+        }
+
+        if (typeof item.content === 'string') {
+            parts.push(item.content);
+            continue;
+        }
+
+        if (Array.isArray(item.content)) {
+            const nested = extractTextFromContent(item.content);
+            if (nested) {
+                parts.push(nested);
+            }
+        }
+    }
+
+    if (!parts.length) {
+        return null;
+    }
+
+    return parts.join('');
+}
+
+function extractTextFromOutputArray(output) {
+    if (!Array.isArray(output)) {
+        return null;
+    }
+
+    const parts = [];
+    for (const item of output) {
+        if (!item || typeof item !== 'object') {
+            continue;
+        }
+
+        const direct = extractTextFromContent(item.content);
+        if (direct) {
+            parts.push(direct);
+            continue;
+        }
+
+        if (typeof item.text === 'string') {
+            parts.push(item.text);
+        }
+    }
+
+    if (!parts.length) {
+        return null;
+    }
+
+    return parts.join('');
+}
+
+function extractTextFromResponsePayload(payload) {
+    const choiceMessageText = extractTextFromContent(payload?.choices?.[0]?.message?.content);
+    if (choiceMessageText) {
+        return choiceMessageText;
+    }
+
+    const choiceText = payload?.choices?.[0]?.text;
+    if (typeof choiceText === 'string' && choiceText) {
+        return choiceText;
+    }
+
+    const contentText = extractTextFromContent(payload?.content);
+    if (contentText) {
+        return contentText;
+    }
+
+    if (typeof payload?.output_text === 'string' && payload.output_text) {
+        return payload.output_text;
+    }
+
+    const outputText = extractTextFromOutputArray(payload?.output);
+    if (outputText) {
+        return outputText;
+    }
+
+    return null;
+}
+
+function normalizeResponsePayload(payload) {
+    if (!payload || typeof payload !== 'object') {
+        return { changed: false, payload };
+    }
+
+    if (typeof payload?.choices?.[0]?.message?.content === 'string') {
+        return { changed: false, payload };
+    }
+
+    const text = extractTextFromResponsePayload(payload);
+    if (!text) {
+        return { changed: false, payload };
+    }
+
+    const normalized = { ...payload };
+    if (Array.isArray(payload.choices) && payload.choices[0]?.message) {
+        normalized.choices = payload.choices.map((choice, index) => {
+            if (index !== 0) return choice;
+            return {
+                ...choice,
+                message: {
+                    ...choice.message,
+                    content: text,
+                },
+            };
+        });
+        return { changed: true, payload: normalized };
+    }
+
+    normalized.choices = [{
+        index: 0,
+        message: {
+            role: 'assistant',
+            content: text,
+        },
+        finish_reason: payload?.finish_reason || 'stop',
+    }];
+
+    return { changed: true, payload: normalized };
+}
+
+function getProviderErrorMessage(payload) {
+    const message = payload?.error?.message;
+    if (typeof message === 'string' && message.trim()) {
+        return message.trim();
+    }
+
+    return '';
+}
+
+function isRetryableProviderError(message) {
+    const normalized = String(message || '').toLowerCase();
+    if (!normalized) {
+        return false;
+    }
+
+    return [
+        'internal server error',
+        'bad gateway',
+        'gateway timeout',
+        'timeout',
+        'upstream',
+        'temporarily unavailable',
+        'overload',
+        'rate limit',
+    ].some(token => normalized.includes(token));
+}
+
+function buildTokenRetryValues(body) {
+    const tokenFields = ['max_tokens', 'max_completion_tokens', 'max_output_tokens'];
+    let current = 0;
+
+    for (const field of tokenFields) {
+        const value = Number(body?.[field]);
+        if (Number.isFinite(value) && value > 0) {
+            current = Math.max(current, Math.floor(value));
+        }
+    }
+
+    if (!current) {
+        return [0];
+    }
+
+    const candidates = [
+        current,
+        Math.min(current, 4096),
+        Math.min(current, 2048),
+        Math.min(current, 1536),
+        Math.min(current, 1024),
+        Math.min(current, 768),
+        Math.min(current, 512),
+    ];
+
+    const unique = [];
+    for (const value of candidates) {
+        if (value > 0 && !unique.includes(value)) {
+            unique.push(value);
+        }
+    }
+
+    return unique.length ? unique : [current];
+}
+
+function applyMaxTokensForAttempt(body, maxTokens) {
+    if (!maxTokens || maxTokens <= 0) {
+        return body;
+    }
+
+    const next = { ...body };
+
+    if (next.max_tokens != null) {
+        next.max_tokens = maxTokens;
+    }
+    if (next.max_completion_tokens != null) {
+        next.max_completion_tokens = maxTokens;
+    }
+    if (next.max_output_tokens != null) {
+        next.max_output_tokens = Math.min(maxTokens, Number(next.max_output_tokens) || maxTokens);
+    }
+
+    return next;
+}
+
+async function tryParseJsonResponse(response) {
+    try {
+        return await response.clone().json();
+    } catch {
+        return null;
+    }
+}
+
+function createProviderErrorResponse(response, payload) {
+    const headers = new Headers(response.headers);
+    headers.set('content-type', 'application/json; charset=utf-8');
+    headers.delete('content-length');
+
+    return new Response(JSON.stringify(payload), {
+        status: 502,
+        statusText: 'Bad Gateway',
+        headers,
+    });
+}
+
+async function sendWithFallback(target, options, requestBody) {
+    const tokenRetries = buildTokenRetryValues(requestBody);
+    let lastResponse = null;
+
+    for (let i = 0; i < tokenRetries.length; i++) {
+        const maxTokens = tokenRetries[i];
+        const bodyForAttempt = applyMaxTokensForAttempt(requestBody, maxTokens);
+
+        if (i > 0) {
+            console.warn(`[${EXTENSION_NAME}] Retrying MemoryBooks request with max_tokens=${maxTokens}`);
+        }
+
+        const response = await originalFetch(target, {
+            ...options,
+            body: JSON.stringify(bodyForAttempt),
+        });
+        lastResponse = response;
+
+        const payload = await tryParseJsonResponse(response);
+        const providerErrorMessage = getProviderErrorMessage(payload);
+        const hasRetrySlot = i < tokenRetries.length - 1;
+
+        if (hasRetrySlot && (response.status >= 500 || isRetryableProviderError(providerErrorMessage))) {
+            continue;
+        }
+
+        if (payload && providerErrorMessage && response.ok) {
+            console.error(`[${EXTENSION_NAME}] Upstream returned error payload: ${providerErrorMessage}`);
+            return createProviderErrorResponse(response, payload);
+        }
+
+        return response;
+    }
+
+    return lastResponse;
+}
+
+async function normalizeMemoryBooksResponse(response) {
+    if (!response?.ok) {
+        return response;
+    }
+
+    const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('application/json')) {
+        return response;
+    }
+
+    try {
+        const payload = await response.clone().json();
+        const normalized = normalizeResponsePayload(payload);
+        if (!normalized.changed) {
+            return response;
+        }
+
+        const headers = new Headers(response.headers);
+        headers.set('content-type', 'application/json; charset=utf-8');
+        headers.delete('content-length');
+
+        console.log(`[${EXTENSION_NAME}] Normalized MemoryBooks response payload`);
+        return new Response(JSON.stringify(normalized.payload), {
+            status: response.status,
+            statusText: response.statusText,
+            headers,
+        });
+    } catch {
+        return response;
+    }
+}
+
 function enrichRequestBody(body) {
     const enriched = { ...body };
     const content = body.messages[0].content;
@@ -148,10 +466,8 @@ window.fetch = async function (target, options) {
 
         console.log(`[${EXTENSION_NAME}] Intercepted MemoryBooks request (${splitInfo})`);
 
-        return originalFetch(target, {
-            ...options,
-            body: JSON.stringify(enriched.body),
-        });
+        const response = await sendWithFallback(target, options, enriched.body);
+        return normalizeMemoryBooksResponse(response);
     } catch (err) {
         console.error(`[${EXTENSION_NAME}] Error enriching request, falling back:`, err);
     }
