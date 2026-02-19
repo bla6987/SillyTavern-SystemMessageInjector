@@ -1,3 +1,5 @@
+import { generateQuietPrompt } from '../../../script.js';
+
 const EXTENSION_NAME = 'SystemMessageInjector';
 const SCENE_DELIMITER = '=== SCENE TRANSCRIPT ===';
 
@@ -18,24 +20,44 @@ window.fetch = async function (url, options) {
                 typeof body.messages[0].content === 'string' &&
                 body.messages[0].content.includes(SCENE_DELIMITER)
             ) {
-                const content = body.messages[0].content;
-                const idx = content.indexOf(SCENE_DELIMITER);
+                const promptContent = body.messages[0].content;
 
-                const systemContent = content.substring(0, idx).trim();
-                const userContent = content.substring(idx).trim();
+                // Extract max_tokens from whichever field MemoryBooks set
+                const maxTokens = body.max_tokens
+                    ?? body.max_completion_tokens
+                    ?? body.max_output_tokens
+                    ?? null;
 
-                if (systemContent && userContent) {
-                    body.messages = [
-                        { role: 'system', content: systemContent },
-                        { role: 'user', content: userContent },
-                    ];
+                const responseLength = (typeof maxTokens === 'number' && maxTokens > 0)
+                    ? maxTokens
+                    : null;
 
-                    options = { ...options, body: JSON.stringify(body) };
-                    console.log(`[${EXTENSION_NAME}] Split into system + user messages`);
-                }
+                console.log(`[${EXTENSION_NAME}] Redirecting through generateQuietPrompt`
+                    + (responseLength ? ` (maxTokens=${responseLength})` : ''));
+
+                const resultText = await generateQuietPrompt({
+                    quietPrompt: promptContent,
+                    responseLength,
+                    skipWIAN: true,
+                    removeReasoning: false,
+                });
+
+                // Wrap in OpenAI-format response that MemoryBooks expects
+                const fakeBody = JSON.stringify({
+                    choices: [{
+                        message: { content: resultText || '' },
+                        finish_reason: 'stop',
+                    }],
+                });
+
+                return new Response(fakeBody, {
+                    status: 200,
+                    statusText: 'OK',
+                    headers: { 'Content-Type': 'application/json' },
+                });
             }
-        } catch {
-            // Don't break the original request
+        } catch (err) {
+            console.error(`[${EXTENSION_NAME}] Error during redirect, falling back to raw fetch:`, err);
         }
     }
 
