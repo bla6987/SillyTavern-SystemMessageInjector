@@ -1,7 +1,43 @@
-import { generateQuietPrompt } from '../../../script.js';
+import { name1, name2 } from '../../../../script.js';
+import { oai_settings } from '../../../openai.js';
 
 const EXTENSION_NAME = 'SystemMessageInjector';
-const SCENE_DELIMITER = '=== SCENE TRANSCRIPT ===';
+
+const MEMORYBOOKS_DELIMITERS = [
+    '=== SCENE TRANSCRIPT ===',
+    '=== SCENE TEXT ===',
+    '=== MEMORIES ===',
+    '=== ARC SUMMARY ===',
+];
+
+function isMemoryBooksRequest(body) {
+    if (body?.messages?.length !== 1) return false;
+    if (body.messages[0].role !== 'user') return false;
+    const content = body.messages[0].content;
+    if (typeof content !== 'string') return false;
+    return MEMORYBOOKS_DELIMITERS.some(d => content.includes(d));
+}
+
+function enrichRequestBody(body) {
+    const enriched = { ...body };
+
+    // Add fields the ST backend needs for custom source formatting
+    if (body.chat_completion_source === 'custom') {
+        enriched.custom_include_body ??= oai_settings.custom_include_body || '';
+        enriched.custom_exclude_body ??= oai_settings.custom_exclude_body || '';
+        enriched.custom_include_headers ??= oai_settings.custom_include_headers || '';
+    }
+
+    // Post-processing (message merging) — applies to all sources
+    enriched.custom_prompt_post_processing ??= oai_settings.custom_prompt_post_processing || '';
+
+    // Metadata for getPromptNames() used in message post-processing
+    enriched.user_name ??= name1;
+    enriched.char_name ??= name2;
+    enriched.group_names ??= [];
+
+    return enriched;
+}
 
 const originalFetch = window.fetch;
 
@@ -14,50 +50,19 @@ window.fetch = async function (url, options) {
         try {
             const body = JSON.parse(options.body);
 
-            if (
-                body.messages?.length === 1 &&
-                body.messages[0].role === 'user' &&
-                typeof body.messages[0].content === 'string' &&
-                body.messages[0].content.includes(SCENE_DELIMITER)
-            ) {
-                const promptContent = body.messages[0].content;
+            if (isMemoryBooksRequest(body)) {
+                const matched = MEMORYBOOKS_DELIMITERS.find(d =>
+                    body.messages[0].content.includes(d));
+                console.log(`[${EXTENSION_NAME}] Enriching request (${matched})`);
 
-                // Extract max_tokens from whichever field MemoryBooks set
-                const maxTokens = body.max_tokens
-                    ?? body.max_completion_tokens
-                    ?? body.max_output_tokens
-                    ?? null;
-
-                const responseLength = (typeof maxTokens === 'number' && maxTokens > 0)
-                    ? maxTokens
-                    : null;
-
-                console.log(`[${EXTENSION_NAME}] Redirecting through generateQuietPrompt`
-                    + (responseLength ? ` (maxTokens=${responseLength})` : ''));
-
-                const resultText = await generateQuietPrompt({
-                    quietPrompt: promptContent,
-                    responseLength,
-                    skipWIAN: true,
-                    removeReasoning: false,
-                });
-
-                // Wrap in OpenAI-format response that MemoryBooks expects
-                const fakeBody = JSON.stringify({
-                    choices: [{
-                        message: { content: resultText || '' },
-                        finish_reason: 'stop',
-                    }],
-                });
-
-                return new Response(fakeBody, {
-                    status: 200,
-                    statusText: 'OK',
-                    headers: { 'Content-Type': 'application/json' },
+                const enriched = enrichRequestBody(body);
+                return originalFetch.call(this, url, {
+                    ...options,
+                    body: JSON.stringify(enriched),
                 });
             }
         } catch (err) {
-            console.error(`[${EXTENSION_NAME}] Error during redirect, falling back to raw fetch:`, err);
+            console.error(`[${EXTENSION_NAME}] Error enriching request, falling back:`, err);
         }
     }
 
