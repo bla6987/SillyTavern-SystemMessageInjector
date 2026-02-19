@@ -18,8 +18,22 @@ function isMemoryBooksRequest(body) {
     return MEMORYBOOKS_DELIMITERS.some(d => content.includes(d));
 }
 
-function enrichRequestBody(body) {
+function enrichRequestBody(body, delimiter) {
     const enriched = { ...body };
+
+    // Split at the delimiter into system (instructions) + user (data)
+    const content = body.messages[0].content;
+    const idx = content.indexOf(delimiter);
+    if (idx > 0) {
+        const systemContent = content.substring(0, idx).trim();
+        const userContent = content.substring(idx).trim();
+        if (systemContent && userContent) {
+            enriched.messages = [
+                { role: 'system', content: systemContent },
+                { role: 'user', content: userContent },
+            ];
+        }
+    }
 
     // Add fields the ST backend needs for custom source formatting
     if (body.chat_completion_source === 'custom') {
@@ -53,9 +67,9 @@ window.fetch = async function (url, options) {
             if (isMemoryBooksRequest(body)) {
                 const matched = MEMORYBOOKS_DELIMITERS.find(d =>
                     body.messages[0].content.includes(d));
-                console.log(`[${EXTENSION_NAME}] Enriching request (${matched})`);
+                console.log(`[${EXTENSION_NAME}] Enriching + splitting at (${matched})`);
 
-                const enriched = enrichRequestBody(body);
+                const enriched = enrichRequestBody(body, matched);
                 return originalFetch.call(this, url, {
                     ...options,
                     body: JSON.stringify(enriched),
