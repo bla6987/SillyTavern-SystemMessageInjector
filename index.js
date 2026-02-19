@@ -275,9 +275,7 @@ function buildTokenRetryValues(body) {
 
     const candidates = [
         current,
-        Math.min(current, 4096),
         Math.min(current, 2048),
-        Math.min(current, 1536),
         Math.min(current, 1024),
         Math.min(current, 768),
         Math.min(current, 512),
@@ -382,6 +380,7 @@ function buildBodyVariants(requestBody) {
     }
 
     addVariant('split', requestBody);
+    addVariant('split-active-config', applyActiveCustomConfig(requestBody));
 
     const messages = requestBody?.messages;
     if (Array.isArray(messages) && messages.length === 2
@@ -415,6 +414,27 @@ function buildBodyVariants(requestBody) {
     }
 
     return variants;
+}
+
+function applyActiveCustomConfig(body) {
+    const next = { ...body };
+
+    const activeUrl = String(oai_settings.custom_url || '').trim();
+    if (activeUrl) {
+        next.custom_url = activeUrl;
+    }
+
+    const activeModel = String(oai_settings.custom_model || '').trim();
+    if (activeModel) {
+        next.model = activeModel;
+        next.custom_model_id = activeModel;
+    }
+
+    next.custom_include_body = String(oai_settings.custom_include_body ?? next.custom_include_body ?? '');
+    next.custom_include_headers = String(oai_settings.custom_include_headers ?? next.custom_include_headers ?? '');
+    next.custom_exclude_body = String(oai_settings.custom_exclude_body ?? next.custom_exclude_body ?? '');
+
+    return next;
 }
 
 function sleep(ms) {
