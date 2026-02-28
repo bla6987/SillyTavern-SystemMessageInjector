@@ -1254,7 +1254,7 @@ async function trySendWithSillyTavernWorkflow(requestBody) {
     return null;
 }
 
-async function sendWithFallback(target, options, requestBody) {
+async function sendWithFallback(fetchFn, target, options, requestBody) {
     const MAX_TOTAL_ATTEMPTS = 2;
     const MAX_VARIANTS = 2;
     const MAX_TOKEN_STEPS = 1;
@@ -1295,7 +1295,7 @@ async function sendWithFallback(target, options, requestBody) {
                 console.warn(`[${EXTENSION_NAME}] Retrying MemoryBooks request with max_tokens=${maxTokens}`);
             }
 
-            let response = await originalFetch(target, {
+            let response = await fetchFn(target, {
                 ...options,
                 body: JSON.stringify(bodyForAttempt),
             });
@@ -1409,6 +1409,7 @@ function enrichRequestBody(body) {
 }
 
 const originalFetch = window.fetch.bind(window);
+let unregisterRuntimeBusInterceptor = null;
 
 window.SystemMessageInjector = {
     getBuildInfo: () => ({ extension: EXTENSION_NAME, build: BUILD_TAG }),
@@ -1433,67 +1434,184 @@ window.SystemMessageInjector = {
     },
 };
 
-window.fetch = async function (target, options) {
-    const url = getRequestUrl(target);
+function installLegacyFetchInterceptor() {
+    window.fetch = async function (target, options) {
+        const url = getRequestUrl(target);
 
-    if (!isGenerateRequest(url, options, target)) {
-        return originalFetch(target, options);
-    }
-
-    try {
-        if (typeof options?.body !== 'string') {
+        if (!isGenerateRequest(url, options, target)) {
             return originalFetch(target, options);
         }
 
-        const body = JSON.parse(options.body);
-        const stack = new Error().stack || '';
-        const memoryBooksDetected = isMemoryBooksRequest(body, stack);
-        const customEndpointDetected = isCustomEndpointRequest(body);
-
-        if (!memoryBooksDetected || !customEndpointDetected) {
-            const passthroughResponse = await originalFetch(target, options);
-            await recordRequestEnvelope({
-                isMemoryBooks: memoryBooksDetected,
-                stage: 'passthrough',
-                variant: memoryBooksDetected ? 'non-custom-or-unhandled' : 'normal',
-                requestBody: body,
-                response: passthroughResponse,
-            });
-            return passthroughResponse;
-        }
-
-        const enriched = enrichRequestBody(body);
-        if (!enriched.didSplit) {
-            return originalFetch(target, options);
-        }
-        const splitInfo = enriched.didSplit
-            ? `split at "${enriched.delimiter}"`
-            : 'no split marker found';
-
-        console.log(`[${EXTENSION_NAME}] Intercepted MemoryBooks request (${splitInfo})`);
-        await recordRequestEnvelope({
-            isMemoryBooks: true,
-            stage: 'transformed',
-            variant: enriched.didSplit ? 'split' : 'no-split',
-            requestBody: enriched.body,
-        });
-
-        if (shouldTrySillyTavernWorkflow()) {
-            const stWorkflowResponse = await trySendWithSillyTavernWorkflow(enriched.body);
-            if (stWorkflowResponse) {
-                return stWorkflowResponse;
+        try {
+            if (typeof options?.body !== 'string') {
+                return originalFetch(target, options);
             }
-        } else {
-            console.log(`[${EXTENSION_NAME}] Skipping ST workflow: normal chat uses streaming`);
+
+            const body = JSON.parse(options.body);
+            const stack = new Error().stack || '';
+            const memoryBooksDetected = isMemoryBooksRequest(body, stack);
+            const customEndpointDetected = isCustomEndpointRequest(body);
+
+            if (!memoryBooksDetected || !customEndpointDetected) {
+                const passthroughResponse = await originalFetch(target, options);
+                await recordRequestEnvelope({
+                    isMemoryBooks: memoryBooksDetected,
+                    stage: 'passthrough',
+                    variant: memoryBooksDetected ? 'non-custom-or-unhandled' : 'normal',
+                    requestBody: body,
+                    response: passthroughResponse,
+                });
+                return passthroughResponse;
+            }
+
+            const enriched = enrichRequestBody(body);
+            if (!enriched.didSplit) {
+                return originalFetch(target, options);
+            }
+            const splitInfo = enriched.didSplit
+                ? `split at "${enriched.delimiter}"`
+                : 'no split marker found';
+
+            console.log(`[${EXTENSION_NAME}] Intercepted MemoryBooks request (${splitInfo})`);
+            await recordRequestEnvelope({
+                isMemoryBooks: true,
+                stage: 'transformed',
+                variant: enriched.didSplit ? 'split' : 'no-split',
+                requestBody: enriched.body,
+            });
+
+            if (shouldTrySillyTavernWorkflow()) {
+                const stWorkflowResponse = await trySendWithSillyTavernWorkflow(enriched.body);
+                if (stWorkflowResponse) {
+                    return stWorkflowResponse;
+                }
+            } else {
+                console.log(`[${EXTENSION_NAME}] Skipping ST workflow: normal chat uses streaming`);
+            }
+
+            const response = await sendWithFallback(originalFetch, target, options, enriched.body);
+            return normalizeMemoryBooksResponse(response);
+        } catch (err) {
+            console.error(`[${EXTENSION_NAME}] Error enriching request, falling back:`, err);
         }
 
-        const response = await sendWithFallback(target, options, enriched.body);
-        return normalizeMemoryBooksResponse(response);
-    } catch (err) {
-        console.error(`[${EXTENSION_NAME}] Error enriching request, falling back:`, err);
+        return originalFetch(target, options);
+    };
+}
+
+function installRuntimeBusFetchInterceptor() {
+    const runtimeBus = window.STRuntimeBus;
+    if (!runtimeBus?.fetch?.registerInterceptor) {
+        return false;
     }
 
-    return originalFetch(target, options);
-};
+    if (unregisterRuntimeBusInterceptor) {
+        try {
+            unregisterRuntimeBusInterceptor();
+        } catch {
+            // ignore stale unregister failures
+        }
+        unregisterRuntimeBusInterceptor = null;
+    }
+
+    unregisterRuntimeBusInterceptor = runtimeBus.fetch.registerInterceptor({
+        id: EXTENSION_NAME,
+        priority: 40,
+        requestTransform: async (reqCtx) => {
+            const { target, options } = reqCtx;
+            const url = getRequestUrl(target);
+            if (!isGenerateRequest(url, options, target)) return null;
+            if (typeof options?.body !== 'string') return null;
+
+            try {
+                const body = JSON.parse(options.body);
+                const stack = new Error().stack || '';
+                const memoryBooksDetected = isMemoryBooksRequest(body, stack);
+                const customEndpointDetected = isCustomEndpointRequest(body);
+
+                if (!memoryBooksDetected || !customEndpointDetected) {
+                    return {
+                        meta: {
+                            smi: {
+                                passthrough: true,
+                                memoryBooksDetected,
+                                variant: memoryBooksDetected ? 'non-custom-or-unhandled' : 'normal',
+                                requestBody: body,
+                            },
+                        },
+                    };
+                }
+
+                const enriched = enrichRequestBody(body);
+                if (!enriched.didSplit) {
+                    return null;
+                }
+
+                const splitInfo = enriched.didSplit
+                    ? `split at "${enriched.delimiter}"`
+                    : 'no split marker found';
+                console.log(`[${EXTENSION_NAME}] Intercepted MemoryBooks request (${splitInfo})`);
+                await recordRequestEnvelope({
+                    isMemoryBooks: true,
+                    stage: 'transformed',
+                    variant: enriched.didSplit ? 'split' : 'no-split',
+                    requestBody: enriched.body,
+                });
+
+                if (shouldTrySillyTavernWorkflow()) {
+                    const stWorkflowResponse = await trySendWithSillyTavernWorkflow(enriched.body);
+                    if (stWorkflowResponse) {
+                        return {
+                            shortCircuitResponse: stWorkflowResponse,
+                            meta: {
+                                smi: {
+                                    usedStWorkflow: true,
+                                },
+                            },
+                        };
+                    }
+                } else {
+                    console.log(`[${EXTENSION_NAME}] Skipping ST workflow: normal chat uses streaming`);
+                }
+
+                const response = await sendWithFallback(reqCtx.baseFetch, target, options, enriched.body);
+                return {
+                    shortCircuitResponse: response,
+                    meta: {
+                        smi: {
+                            shouldNormalize: true,
+                        },
+                    },
+                };
+            } catch (error) {
+                console.error(`[${EXTENSION_NAME}] Runtime bus transform failed, passing through`, error);
+                return null;
+            }
+        },
+        responseTransform: async (resCtx) => {
+            if (resCtx?.request?.meta?.smi?.shouldNormalize) {
+                return normalizeMemoryBooksResponse(resCtx.response);
+            }
+            return resCtx.response;
+        },
+        responseObserve: async (resCtx) => {
+            const smiMeta = resCtx?.request?.meta?.smi;
+            if (!smiMeta?.passthrough) return;
+            await recordRequestEnvelope({
+                isMemoryBooks: Boolean(smiMeta.memoryBooksDetected),
+                stage: 'passthrough',
+                variant: smiMeta.variant || 'normal',
+                requestBody: smiMeta.requestBody || null,
+                response: resCtx.response,
+            });
+        },
+    });
+
+    return true;
+}
+
+if (!installRuntimeBusFetchInterceptor()) {
+    installLegacyFetchInterceptor();
+}
 
 console.log(`[${EXTENSION_NAME}] Active build=${BUILD_TAG}`);
