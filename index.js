@@ -1,10 +1,88 @@
 import { oai_settings, sendOpenAIRequest } from '../../../openai.js';
 
 const EXTENSION_NAME = 'SystemMessageInjector';
-const BUILD_TAG = '2026-02-19-stream-bridge-v3';
+const BUILD_TAG = '2026-10-25-bounded-diagnostics';
 const RAW_CAPTURE_BODY_LIMIT = 50000;
 const RAW_CAPTURE_HISTORY_LIMIT = 20;
 const REQUEST_ENVELOPE_HISTORY_LIMIT = 50;
+const REQUEST_HISTORY_BYTE_LIMIT = 256 * 1024;
+const RAW_HISTORY_BYTE_LIMIT = 512 * 1024;
+const DIAGNOSTIC_TTL_MS = 15 * 60 * 1000;
+const RESPONSE_INSPECTION_BYTE_LIMIT = 128 * 1024;
+let diagnosticsEnabled = false;
+let diagnosticExpiryTimer = null;
+// Functional fallback configuration is independent of optional debug history.
+let lastWorkingNormalConfig = null;
+
+function diagnosticString(value, limit = 2048) {
+    if (typeof value !== 'string') return ['number', 'boolean'].includes(typeof value) ? value : null;
+    return truncateText(value, limit);
+}
+
+function pruneDiagnosticHistory(history, byteLimit, countLimit) {
+    const cutoff = Date.now() - DIAGNOSTIC_TTL_MS;
+    let bytes = 0;
+    let keep = 0;
+    for (const item of history) {
+        if (Date.parse(item.timestamp) < cutoff) break;
+        const cost = 2 * JSON.stringify(item).length;
+        if (keep >= countLimit || bytes + cost > byteLimit) break;
+        bytes += cost;
+        keep++;
+    }
+    history.length = keep;
+    return history;
+}
+
+function refreshDiagnosticExpiry() {
+    if (diagnosticExpiryTimer !== null) clearTimeout(diagnosticExpiryTimer);
+    diagnosticExpiryTimer = null;
+    const requests = pruneDiagnosticHistory(window.__SMI_REQUEST_ENVELOPE_HISTORY || [], REQUEST_HISTORY_BYTE_LIMIT, REQUEST_ENVELOPE_HISTORY_LIMIT);
+    const raw = pruneDiagnosticHistory(window.__SMI_RAW_RESPONSE_HISTORY || [], RAW_HISTORY_BYTE_LIMIT, RAW_CAPTURE_HISTORY_LIMIT);
+    window.__SMI_LAST_REQUEST_ENVELOPE = requests[0] || null;
+    window.__SMI_LAST_RAW_RESPONSE = raw[0] || null;
+    const oldest = Math.min(...[requests.at(-1), raw.at(-1)].filter(Boolean).map(item => Date.parse(item.timestamp)));
+    if (Number.isFinite(oldest)) {
+        diagnosticExpiryTimer = setTimeout(refreshDiagnosticExpiry, Math.max(1, oldest + DIAGNOSTIC_TTL_MS + 1 - Date.now()));
+    }
+}
+
+async function readResponsePrefix(response, maxBytes = RESPONSE_INSPECTION_BYTE_LIMIT) {
+    const clone = response.clone();
+    const reader = clone.body?.getReader?.();
+    if (!reader) return { text: '', truncated: false };
+    const decoder = new TextDecoder();
+    let text = '';
+    let bytes = 0;
+    let complete = false;
+    try {
+        while (bytes < maxBytes) {
+            const { done, value } = await reader.read();
+            if (done) { complete = true; break; }
+            const part = value.subarray(0, maxBytes - bytes);
+            bytes += part.byteLength;
+            text += decoder.decode(part, { stream: true });
+        }
+        text += decoder.decode();
+        return { text, truncated: !complete };
+    } finally {
+        if (!complete) reader.cancel().catch(() => {});
+        reader.releaseLock?.();
+    }
+}
+
+function prepareRequestCapture(body) {
+    const workingConfig = {};
+    // Only fields consumed by applyWorkingNormalConfig; no messages or tools.
+    for (const key of ['chat_completion_source', 'model', 'custom_model_id', 'custom_url',
+        'custom_include_body', 'custom_include_headers', 'custom_exclude_body',
+        'custom_prompt_post_processing', 'user_name', 'char_name']) {
+        const value = body?.[key];
+        if (typeof value === 'string' || value == null) workingConfig[key] = value ?? null;
+    }
+    workingConfig.group_names_count = Array.isArray(body?.group_names) ? body.group_names.length : null;
+    return { request: summarizeRequestBodyForCapture(body), request_shape: buildRequestShapeForDiff(body), workingConfig };
+}
 
 const MEMORYBOOKS_DELIMITERS = [
     '=== SCENE TRANSCRIPT ===',
@@ -212,11 +290,11 @@ function cloneHeadersAsObject(headers) {
         return result;
     }
 
-    for (const [key, value] of headers.entries()) {
+    for (const [key, value] of Array.from(headers.entries()).slice(0, 32)) {
         if (key.toLowerCase() === 'authorization') {
             result[key] = '[redacted]';
         } else {
-            result[key] = value;
+            result[truncateText(key, 128)] = truncateText(value, 512);
         }
     }
 
@@ -226,18 +304,18 @@ function cloneHeadersAsObject(headers) {
 function summarizeRequestBodyForCapture(requestBody) {
     const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
     return {
-        model: requestBody?.model ?? null,
-        custom_model_id: requestBody?.custom_model_id ?? null,
-        custom_url: requestBody?.custom_url ?? null,
-        chat_completion_source: requestBody?.chat_completion_source ?? null,
-        max_tokens: requestBody?.max_tokens ?? null,
-        max_completion_tokens: requestBody?.max_completion_tokens ?? null,
-        max_output_tokens: requestBody?.max_output_tokens ?? null,
-        stream: requestBody?.stream ?? null,
+        model: diagnosticString(requestBody?.model),
+        custom_model_id: diagnosticString(requestBody?.custom_model_id),
+        custom_url: diagnosticString(requestBody?.custom_url),
+        chat_completion_source: diagnosticString(requestBody?.chat_completion_source),
+        max_tokens: diagnosticString(requestBody?.max_tokens),
+        max_completion_tokens: diagnosticString(requestBody?.max_completion_tokens),
+        max_output_tokens: diagnosticString(requestBody?.max_output_tokens),
+        stream: diagnosticString(requestBody?.stream),
         message_count: messages.length,
-        messages: messages.map((m, index) => ({
-            index,
-            role: m?.role ?? null,
+        messages: (diagnosticsEnabled ? messages.slice(-64) : []).map((m, index) => ({
+            index: Math.max(0, messages.length - 64) + index,
+            role: diagnosticString(m?.role, 64),
             content_length: typeof m?.content === 'string' ? m.content.length : null,
             content_preview: typeof m?.content === 'string'
                 ? truncateText(m.content, 300)
@@ -249,28 +327,29 @@ function summarizeRequestBodyForCapture(requestBody) {
 function buildRequestShapeForDiff(requestBody) {
     const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
     return {
-        chat_completion_source: requestBody?.chat_completion_source ?? null,
-        model: requestBody?.model ?? null,
-        custom_model_id: requestBody?.custom_model_id ?? null,
-        custom_url: requestBody?.custom_url ?? null,
-        temperature: requestBody?.temperature ?? null,
-        max_tokens: requestBody?.max_tokens ?? null,
-        max_completion_tokens: requestBody?.max_completion_tokens ?? null,
-        max_output_tokens: requestBody?.max_output_tokens ?? null,
-        stream: requestBody?.stream ?? null,
-        custom_prompt_post_processing: requestBody?.custom_prompt_post_processing ?? null,
-        custom_include_body: requestBody?.custom_include_body ?? null,
-        custom_include_headers: requestBody?.custom_include_headers ?? null,
-        custom_exclude_body: requestBody?.custom_exclude_body ?? null,
-        user_name: requestBody?.user_name ?? null,
-        char_name: requestBody?.char_name ?? null,
+        chat_completion_source: diagnosticString(requestBody?.chat_completion_source),
+        model: diagnosticString(requestBody?.model),
+        custom_model_id: diagnosticString(requestBody?.custom_model_id),
+        custom_url: diagnosticString(requestBody?.custom_url),
+        temperature: diagnosticString(requestBody?.temperature),
+        max_tokens: diagnosticString(requestBody?.max_tokens),
+        max_completion_tokens: diagnosticString(requestBody?.max_completion_tokens),
+        max_output_tokens: diagnosticString(requestBody?.max_output_tokens),
+        stream: diagnosticString(requestBody?.stream),
+        custom_prompt_post_processing: diagnosticString(requestBody?.custom_prompt_post_processing),
+        custom_include_body: diagnosticString(requestBody?.custom_include_body),
+        custom_include_headers: diagnosticString(requestBody?.custom_include_headers),
+        custom_exclude_body: diagnosticString(requestBody?.custom_exclude_body),
+        user_name: diagnosticString(requestBody?.user_name),
+        char_name: diagnosticString(requestBody?.char_name),
         group_names_count: Array.isArray(requestBody?.group_names) ? requestBody.group_names.length : null,
         stop_count: Array.isArray(requestBody?.stop) ? requestBody.stop.length : null,
         tool_count: Array.isArray(requestBody?.tools) ? requestBody.tools.length : null,
-        messages: messages.map((message, index) => ({
-            index,
-            role: message?.role ?? null,
-            name: message?.name ?? null,
+        message_count: messages.length,
+        messages: (diagnosticsEnabled ? messages.slice(-64) : []).map((message, index) => ({
+            index: Math.max(0, messages.length - 64) + index,
+            role: diagnosticString(message?.role, 64),
+            name: diagnosticString(message?.name, 256),
             content_type: Array.isArray(message?.content) ? 'array' : typeof message?.content,
             content_length: typeof message?.content === 'string' ? message.content.length : null,
         })),
@@ -328,15 +407,18 @@ function diffRequestShapes(leftShape, rightShape) {
 }
 
 function publishRequestEnvelope(envelope) {
+    if (!diagnosticsEnabled) {
+        envelope.request.messages = [];
+        envelope.request_shape.messages = [];
+    }
     const history = Array.isArray(window.__SMI_REQUEST_ENVELOPE_HISTORY)
         ? window.__SMI_REQUEST_ENVELOPE_HISTORY
         : [];
     history.unshift(envelope);
-    if (history.length > REQUEST_ENVELOPE_HISTORY_LIMIT) {
-        history.length = REQUEST_ENVELOPE_HISTORY_LIMIT;
-    }
+    pruneDiagnosticHistory(history, REQUEST_HISTORY_BYTE_LIMIT, REQUEST_ENVELOPE_HISTORY_LIMIT);
     window.__SMI_REQUEST_ENVELOPE_HISTORY = history;
-    window.__SMI_LAST_REQUEST_ENVELOPE = envelope;
+    window.__SMI_LAST_REQUEST_ENVELOPE = history[0] || null;
+    refreshDiagnosticExpiry();
 }
 
 async function recordRequestEnvelope({
@@ -344,17 +426,20 @@ async function recordRequestEnvelope({
     stage,
     variant,
     requestBody,
+    requestCapture = null,
     response = null,
     responsePayload = null,
 }) {
+    const capture = requestCapture || prepareRequestCapture(requestBody);
+    requestBody = null;
     const envelope = {
         id: `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
         timestamp: new Date().toISOString(),
         is_memorybooks: Boolean(isMemoryBooks),
         stage: String(stage || ''),
         variant: String(variant || ''),
-        request: summarizeRequestBodyForCapture(requestBody),
-        request_shape: buildRequestShapeForDiff(requestBody),
+        request: capture.request,
+        request_shape: capture.request_shape,
         response: null,
     };
 
@@ -373,15 +458,17 @@ async function recordRequestEnvelope({
             const errorMessage = responsePayload?.error?.message;
             if (typeof errorMessage === 'string' && errorMessage.trim()) {
                 summary.has_error_payload = true;
-                summary.error_message = errorMessage.trim();
+                summary.error_message = truncateText(errorMessage.trim(), 1000);
             }
-        } else if (response.ok && !requestBody?.stream && contentType.includes('application/json')) {
+        } else if (response.ok && !capture.request.stream && contentType.includes('application/json')) {
             try {
-                const parsed = await response.clone().json();
+                const prefix = await readResponsePrefix(response);
+                summary.inspection_truncated = prefix.truncated;
+                const parsed = prefix.truncated ? null : JSON.parse(prefix.text);
                 const errorMessage = parsed?.error?.message;
                 if (typeof errorMessage === 'string' && errorMessage.trim()) {
                     summary.has_error_payload = true;
-                    summary.error_message = errorMessage.trim();
+                    summary.error_message = truncateText(errorMessage.trim(), 1000);
                 }
             } catch {
                 // ignore parse errors for envelope summaries
@@ -391,10 +478,15 @@ async function recordRequestEnvelope({
         envelope.response = summary;
     }
 
+    if (!isMemoryBooks && envelope.response?.ok && !envelope.response.has_error_payload
+        && !envelope.response.inspection_truncated && capture.workingConfig.chat_completion_source === 'custom') {
+        lastWorkingNormalConfig = capture.workingConfig;
+    }
     publishRequestEnvelope(envelope);
 }
 
 function findLastEnvelope(predicate) {
+    refreshDiagnosticExpiry();
     const history = Array.isArray(window.__SMI_REQUEST_ENVELOPE_HISTORY)
         ? window.__SMI_REQUEST_ENVELOPE_HISTORY
         : [];
@@ -444,16 +536,7 @@ function diffLastMemoryBooksVsNormal() {
 }
 
 function getWorkingNormalShape() {
-    const normal = getLastNormalEnvelope();
-    if (!normal || !normal.request_shape) {
-        return null;
-    }
-
-    if (normal.request_shape.chat_completion_source !== 'custom') {
-        return null;
-    }
-
-    return normal.request_shape;
+    return lastWorkingNormalConfig;
 }
 
 function applyWorkingNormalConfig(body) {
@@ -507,12 +590,11 @@ function publishRawCapture(capture) {
         ? window.__SMI_RAW_RESPONSE_HISTORY
         : [];
     history.unshift(capture);
-    if (history.length > RAW_CAPTURE_HISTORY_LIMIT) {
-        history.length = RAW_CAPTURE_HISTORY_LIMIT;
-    }
+    pruneDiagnosticHistory(history, RAW_HISTORY_BYTE_LIMIT, RAW_CAPTURE_HISTORY_LIMIT);
 
     window.__SMI_RAW_RESPONSE_HISTORY = history;
-    window.__SMI_LAST_RAW_RESPONSE = capture;
+    window.__SMI_LAST_RAW_RESPONSE = history[0] || null;
+    refreshDiagnosticExpiry();
 }
 
 async function recordRawCapture({
@@ -524,6 +606,7 @@ async function recordRawCapture({
     payload = null,
     error = null,
 }) {
+    if (!diagnosticsEnabled) return;
     const capture = {
         timestamp: new Date().toISOString(),
         channel,
@@ -536,11 +619,12 @@ async function recordRawCapture({
 
     if (response) {
         let bodyText = '';
+        let truncated = false;
         try {
-            bodyText = await response.clone().text();
-        } catch {
-            bodyText = '';
-        }
+            const prefix = await readResponsePrefix(response, RAW_CAPTURE_BODY_LIMIT);
+            bodyText = prefix.text;
+            truncated = prefix.truncated;
+        } catch { /* diagnostics must not interfere with generation */ }
 
         capture.response = {
             ok: response.ok,
@@ -548,22 +632,21 @@ async function recordRawCapture({
             statusText: response.statusText,
             headers: cloneHeadersAsObject(response.headers),
             body_text: truncateText(bodyText),
+            body_truncated: truncated,
         };
-
-        if (payload !== null && payload !== undefined) {
-            capture.response.body_json = payload;
-        }
+        // A bounded textual preview is enough. Retaining payload as body_json
+        // would keep the entire response alive despite the preview limit.
     }
 
     if (error) {
         capture.error = {
-            message: String(error?.message || error),
-            stack: String(error?.stack || ''),
+            message: truncateText(String(error?.message || error), 1000),
+            stack: truncateText(String(error?.stack || ''), 2000),
         };
     }
 
-    publishRawCapture(capture);
-    console.log(`[${EXTENSION_NAME}] Captured raw response`, capture);
+    if (diagnosticsEnabled) publishRawCapture(capture);
+    // Do not pin diagnostic objects in the developer console.
 }
 
 function normalizeResponsePayload(payload) {
@@ -944,17 +1027,23 @@ function splitTextIntoChunks(text, maxChunkLength = 2400) {
     return chunks.length ? chunks : [text];
 }
 
-function buildBodyVariants(requestBody) {
-    const variants = [];
-    const seen = new Set();
+function equalJsonBody(left, right) {
+    if (left === right) return true;
+    if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+    if (Array.isArray(left) !== Array.isArray(right)) return false;
+    if (Array.isArray(left) && left.length !== right.length) return false;
+    const keys = Object.keys(left).filter(key => left[key] !== undefined);
+    const other = Object.keys(right).filter(key => right[key] !== undefined);
+    return keys.length === other.length && keys.every(key => Object.hasOwn(right, key) && equalJsonBody(left[key], right[key]));
+}
 
-    function addVariant(name, body) {
-        const key = JSON.stringify(body);
-        if (seen.has(key)) {
-            return;
-        }
-        seen.add(key);
-        variants.push({ name, body });
+function* iterateBodyVariants(requestBody, limit = 2) {
+    const seen = [];
+
+    function* addVariant(name, body) {
+        if (seen.some(previous => equalJsonBody(previous, body))) return;
+        seen.push(body);
+        yield { name, body };
     }
 
     const hasWorkingNormal = Boolean(getWorkingNormalShape());
@@ -973,7 +1062,8 @@ function buildBodyVariants(requestBody) {
         stream: true,
     };
 
-    addVariant(`${primaryName}-stream`, streamPrimaryBody);
+    yield* addVariant(`${primaryName}-stream`, streamPrimaryBody);
+    if (seen.length >= limit) return;
 
     const messages = primaryBody?.messages;
     if (Array.isArray(messages) && messages.length === 2
@@ -987,41 +1077,46 @@ function buildBodyVariants(requestBody) {
         if (user.length > 2800) {
             const chunks = splitTextIntoChunks(user, 2400);
             if (chunks.length > 1) {
-                addVariant(`chunked-${chunks.length}-stream`, {
+                yield* addVariant(`chunked-${chunks.length}-stream`, {
                     ...streamPrimaryBody,
                     messages: [
                         { role: 'system', content: system },
                         ...chunks.map(chunk => ({ role: 'user', content: chunk })),
                     ],
                 });
-                addVariant(`chunked-${chunks.length}`, {
+                if (seen.length >= limit) return;
+                yield* addVariant(`chunked-${chunks.length}`, {
                     ...primaryBody,
                     messages: [
                         { role: 'system', content: system },
                         ...chunks.map(chunk => ({ role: 'user', content: chunk })),
                     ],
                 });
+                if (seen.length >= limit) return;
             }
         }
 
         const merged = `${system}\n\n${user}`.trim();
         if (merged) {
-            addVariant('single-user-merged', {
+            yield* addVariant('single-user-merged', {
                 ...primaryBody,
                 messages: [{ role: 'user', content: merged }],
             });
+            if (seen.length >= limit) return;
         }
     }
 
-    addVariant(primaryName, primaryBody);
-    addVariant(`${secondaryName}-stream`, {
+    yield* addVariant(primaryName, primaryBody);
+    if (seen.length >= limit) return;
+    yield* addVariant(`${secondaryName}-stream`, {
         ...secondaryBody,
         stream: true,
     });
-    addVariant(secondaryName, secondaryBody);
-    addVariant('split', requestBody);
+    if (seen.length >= limit) return;
+    yield* addVariant(secondaryName, secondaryBody);
+    if (seen.length >= limit) return;
+    yield* addVariant('split', requestBody);
 
-    return variants;
 }
 
 function applyActiveCustomConfig(body) {
@@ -1260,17 +1355,18 @@ async function sendWithFallback(fetchFn, target, options, requestBody) {
     const MAX_TOKEN_STEPS = 1;
     const RETRY_BACKOFF_MS = [500];
 
-    const bodyVariants = buildBodyVariants(requestBody).slice(0, MAX_VARIANTS);
-    console.log(`[${EXTENSION_NAME}] Fallback variants`, bodyVariants.map(v => ({
-        name: v.name,
-        stream: Boolean(v.body?.stream),
-        message_count: Array.isArray(v.body?.messages) ? v.body.messages.length : null,
-    })));
     let lastResponse = null;
+    let lastPayload = null;
     let totalAttempts = 0;
+    let variantIndex = -1;
 
-    for (let variantIndex = 0; variantIndex < bodyVariants.length; variantIndex++) {
-        const variant = bodyVariants[variantIndex];
+    for (const variant of iterateBodyVariants(requestBody, MAX_VARIANTS)) {
+        variantIndex++;
+        // Once another variant exists, the previous response will not be
+        // returned. Release its clone-backed body before the next network wait.
+        lastResponse?.body?.cancel?.().catch(() => {});
+        lastResponse = null;
+        lastPayload = null;
         const tokenRetries = buildTokenRetryValues(variant.body).slice(0, MAX_TOKEN_STEPS);
 
         if (variantIndex > 0) {
@@ -1305,6 +1401,7 @@ async function sendWithFallback(fetchFn, target, options, requestBody) {
             lastResponse = response;
 
             const payload = await tryParseJsonResponse(response);
+            lastPayload = payload;
             await recordRequestEnvelope({
                 isMemoryBooks: true,
                 stage: 'fallback-fetch',
@@ -1329,7 +1426,7 @@ async function sendWithFallback(fetchFn, target, options, requestBody) {
             }
 
             if (payload && providerErrorMessage && response.ok) {
-                const hasVariantSlot = variantIndex < bodyVariants.length - 1;
+                const hasVariantSlot = variantIndex < MAX_VARIANTS - 1;
                 if (hasVariantSlot && isRetryableProviderError(providerErrorMessage)) {
                     break;
                 }
@@ -1342,6 +1439,9 @@ async function sendWithFallback(fetchFn, target, options, requestBody) {
         }
     }
 
+    if (lastResponse?.ok && getProviderErrorMessage(lastPayload)) {
+        return createProviderErrorResponse(lastResponse, lastPayload);
+    }
     return lastResponse;
 }
 
@@ -1413,13 +1513,25 @@ let unregisterRuntimeBusInterceptor = null;
 
 window.SystemMessageInjector = {
     getBuildInfo: () => ({ extension: EXTENSION_NAME, build: BUILD_TAG }),
-    getLastRawResponse: () => window.__SMI_LAST_RAW_RESPONSE || null,
+    setDiagnosticsEnabled: (enabled) => {
+        diagnosticsEnabled = enabled === true;
+        window.__SMI_RAW_RESPONSE_HISTORY = [];
+        window.__SMI_LAST_RAW_RESPONSE = null;
+        window.__SMI_REQUEST_ENVELOPE_HISTORY = [];
+        window.__SMI_LAST_REQUEST_ENVELOPE = null;
+        refreshDiagnosticExpiry();
+        return diagnosticsEnabled;
+    },
+    getDiagnosticsInfo: () => ({ enabled: diagnosticsEnabled, ttlMs: DIAGNOSTIC_TTL_MS,
+        requestByteLimit: REQUEST_HISTORY_BYTE_LIMIT, rawByteLimit: RAW_HISTORY_BYTE_LIMIT,
+        maxPreviewMessages: 64 }),
+    getLastRawResponse: () => { refreshDiagnosticExpiry(); return window.__SMI_LAST_RAW_RESPONSE || null; },
     getRawResponseHistory: () => Array.isArray(window.__SMI_RAW_RESPONSE_HISTORY)
-        ? [...window.__SMI_RAW_RESPONSE_HISTORY]
+        ? [...pruneDiagnosticHistory(window.__SMI_RAW_RESPONSE_HISTORY, RAW_HISTORY_BYTE_LIMIT, RAW_CAPTURE_HISTORY_LIMIT)]
         : [],
-    getLastRequestEnvelope: () => window.__SMI_LAST_REQUEST_ENVELOPE || null,
+    getLastRequestEnvelope: () => { refreshDiagnosticExpiry(); return window.__SMI_LAST_REQUEST_ENVELOPE || null; },
     getRequestEnvelopeHistory: () => Array.isArray(window.__SMI_REQUEST_ENVELOPE_HISTORY)
-        ? [...window.__SMI_REQUEST_ENVELOPE_HISTORY]
+        ? [...pruneDiagnosticHistory(window.__SMI_REQUEST_ENVELOPE_HISTORY, REQUEST_HISTORY_BYTE_LIMIT, REQUEST_ENVELOPE_HISTORY_LIMIT)]
         : [],
     getLastMemoryBooksEnvelope,
     getLastNormalEnvelope,
@@ -1427,10 +1539,12 @@ window.SystemMessageInjector = {
     clearRawResponseHistory: () => {
         window.__SMI_RAW_RESPONSE_HISTORY = [];
         window.__SMI_LAST_RAW_RESPONSE = null;
+        refreshDiagnosticExpiry();
     },
     clearRequestEnvelopeHistory: () => {
         window.__SMI_REQUEST_ENVELOPE_HISTORY = [];
         window.__SMI_LAST_REQUEST_ENVELOPE = null;
+        refreshDiagnosticExpiry();
     },
 };
 
@@ -1447,18 +1561,20 @@ function installLegacyFetchInterceptor() {
                 return originalFetch(target, options);
             }
 
-            const body = JSON.parse(options.body);
+            let body = JSON.parse(options.body);
             const stack = new Error().stack || '';
             const memoryBooksDetected = isMemoryBooksRequest(body, stack);
             const customEndpointDetected = isCustomEndpointRequest(body);
 
             if (!memoryBooksDetected || !customEndpointDetected) {
+                const requestCapture = prepareRequestCapture(body);
+                body = null;
                 const passthroughResponse = await originalFetch(target, options);
                 await recordRequestEnvelope({
                     isMemoryBooks: memoryBooksDetected,
                     stage: 'passthrough',
                     variant: memoryBooksDetected ? 'non-custom-or-unhandled' : 'normal',
-                    requestBody: body,
+                    requestCapture,
                     response: passthroughResponse,
                 });
                 return passthroughResponse;
@@ -1501,9 +1617,9 @@ function installLegacyFetchInterceptor() {
 
 function installRuntimeBusFetchInterceptor() {
     const runtimeBus = window.STRuntimeBus;
-    if (!runtimeBus?.fetch?.registerInterceptor) {
-        return false;
-    }
+    if (!runtimeBus?.fetch?.registerInterceptor) return false;
+    if (!runtimeBus.fetch.preservesOuterWrappers && runtimeBus.fetch.getChainInfo?.().installed
+        && window.fetch?.__fetchInterceptorName !== 'runtime_signal_bus') return false;
 
     if (unregisterRuntimeBusInterceptor) {
         try {
@@ -1524,7 +1640,8 @@ function installRuntimeBusFetchInterceptor() {
             if (typeof options?.body !== 'string') return null;
 
             try {
-                const body = JSON.parse(options.body);
+                const body = typeof reqCtx.getRequestJson === 'function'
+                    ? reqCtx.getRequestJson() : JSON.parse(options.body);
                 const stack = new Error().stack || '';
                 const memoryBooksDetected = isMemoryBooksRequest(body, stack);
                 const customEndpointDetected = isCustomEndpointRequest(body);
@@ -1536,7 +1653,7 @@ function installRuntimeBusFetchInterceptor() {
                                 passthrough: true,
                                 memoryBooksDetected,
                                 variant: memoryBooksDetected ? 'non-custom-or-unhandled' : 'normal',
-                                requestBody: body,
+                                requestCapture: prepareRequestCapture(body),
                             },
                         },
                     };
@@ -1558,6 +1675,7 @@ function installRuntimeBusFetchInterceptor() {
                     requestBody: enriched.body,
                 });
 
+                reqCtx.releaseRequestJson?.();
                 if (shouldTrySillyTavernWorkflow()) {
                     const stWorkflowResponse = await trySendWithSillyTavernWorkflow(enriched.body);
                     if (stWorkflowResponse) {
@@ -1597,11 +1715,12 @@ function installRuntimeBusFetchInterceptor() {
         responseObserve: async (resCtx) => {
             const smiMeta = resCtx?.request?.meta?.smi;
             if (!smiMeta?.passthrough) return;
+            delete resCtx.request.meta.smi;
             await recordRequestEnvelope({
                 isMemoryBooks: Boolean(smiMeta.memoryBooksDetected),
                 stage: 'passthrough',
                 variant: smiMeta.variant || 'normal',
-                requestBody: smiMeta.requestBody || null,
+                requestCapture: smiMeta.requestCapture,
                 response: resCtx.response,
             });
         },
